@@ -31,7 +31,7 @@ cargo run -p pixelnode --release
 | 子圖 | 左側面板新增子圖，或選取節點後按「從選取建立子圖」 |
 | 匯出 | 底部：GIF、PNG 序列、Sprite Sheet（+ JSON），整數倍放大 |
 
-## 節點（38 個）
+## 節點（37 個）
 
 | 分類 | 節點 |
 |---|---|
