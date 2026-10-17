@@ -23,7 +23,11 @@ pub(crate) fn all() -> Vec<NodeDef> {
         color_replace(),
         gradient_map(),
         palette_map(),
+        hsv(),
+        crop(),
         mask(),
+        composite(),
+        pixel_sort(),
     ]
 }
 
@@ -417,43 +421,139 @@ fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> {
     )
 }
 
+pub const PALETTE_PRESETS: &[&str] = &["自訂", "Game Boy", "PICO-8", "Sweetie 16", "CGA", "1-bit"];
+
 fn palette_map() -> NodeDef {
+    let mut params = vec![
+        choice("preset", "調色盤", PALETTE_PRESETS, 1),
+        int("count", "自訂色數", 2, 11, 4),
+        choice("mode", "對應方式", &["最接近顏色", "依亮度"], 0),
+        choice("dither", "Dither", &["無", "Bayer 4×4"], 0),
+        f("dither_amount", "Dither 強度", 0.0, 1.0, 0.5),
+    ];
+    let defaults = [
+        [0.10, 0.11, 0.17, 1.0],
+        [0.36, 0.15, 0.36, 1.0],
+        [0.69, 0.24, 0.33, 1.0],
+        [0.94, 0.49, 0.34, 1.0],
+        [1.0, 0.80, 0.46, 1.0],
+        [0.65, 0.94, 0.44, 1.0],
+        [0.22, 0.72, 0.39, 1.0],
+        [0.15, 0.44, 0.47, 1.0],
+        [0.16, 0.21, 0.44, 1.0],
+        [0.23, 0.36, 0.79, 1.0],
+        [0.96, 0.96, 0.96, 1.0],
+    ];
+    const NAMES: [&str; 11] = ["c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10"];
+    const LABELS: [&str; 11] =
+        ["顏色 1", "顏色 2", "顏色 3", "顏色 4", "顏色 5", "顏色 6", "顏色 7", "顏色 8", "顏色 9", "顏色 10", "顏色 11"];
+    for i in 0..11 {
+        params.push(color(NAMES[i], LABELS[i], defaults[i]));
+    }
     def(
         "palette_map",
         "Palette Map",
         Category::Color,
         SURF_IN,
-        vec![
-            int("count", "顏色數", 2, 4, 4),
-            choice("mode", "對應方式", &["最接近顏色", "依亮度"], 0),
-            color("c0", "顏色 1", [0.06, 0.22, 0.06, 1.0]),
-            color("c1", "顏色 2", [0.19, 0.38, 0.19, 1.0]),
-            color("c2", "顏色 3", [0.55, 0.67, 0.06, 1.0]),
-            color("c3", "顏色 4", [0.61, 0.74, 0.06, 1.0]),
-        ],
+        params,
         true,
-        r#"
-fn pick(i: u32) -> vec4<f32> {
-    if (i == 0u) { return P[2]; }
-    if (i == 1u) { return P[3]; }
-    if (i == 2u) { return P[4]; }
-    return P[5];
+        concat!(
+            include_str!("palette.wgsl"),
+            r#"
+fn pal_len() -> u32 {
+    let p = i32(P[0].x);
+    if (p == 0) { return u32(clamp(P[1].x, 2.0, 11.0)); }
+    return preset_len(p);
+}
+fn pal_at(i: u32) -> vec3<f32> {
+    let p = i32(P[0].x);
+    if (p == 0) { return P[5u + min(i, 10u)].rgb; }
+    return preset_color(p, i);
+}
+fn bayer4(p: vec2<u32>) -> f32 {
+    var v = 0u;
+    for (var i = 0u; i < 2u; i++) {
+        let xb = (p.x >> i) & 1u;
+        let yb = (p.y >> i) & 1u;
+        v = v * 4u + 2u * (xb ^ yb) + yb;
+    }
+    return (f32(v) + 0.5) / 16.0 - 0.5;
 }
 fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> {
     let src = in_at(0u, px);
-    let n = u32(clamp(P[0].x, 2.0, 4.0));
+    let n = pal_len();
+    var c = src.rgb;
+    if (i32(P[3].x) == 1) {
+        c = c + bayer4(px) * P[4].x / f32(n - 1u);
+    }
     var best = 0u;
-    if (i32(P[1].x) == 1) {
-        best = min(u32(floor(clamp(pn_luma(src.rgb), 0.0, 1.0) * f32(n))), n - 1u);
+    if (i32(P[2].x) == 1) {
+        best = min(u32(floor(clamp(pn_luma(c), 0.0, 1.0) * f32(n))), n - 1u);
     } else {
         var bd = 1.0e9;
         for (var i = 0u; i < n; i++) {
-            let d = distance(src.rgb, pick(i).rgb);
+            let d = distance(c, pal_at(i));
             if (d < bd) { bd = d; best = i; }
         }
     }
-    let c = pick(best);
-    return vec4<f32>(c.rgb, src.a * c.a);
+    return vec4<f32>(pal_at(best), src.a);
+}
+"#
+        ),
+    )
+}
+
+fn hsv() -> NodeDef {
+    def(
+        "hsv",
+        "HSV",
+        Category::Color,
+        SURF_IN,
+        vec![
+            f("hue", "色相偏移", -0.5, 0.5, 0.0),
+            f("saturation", "飽和度", 0.0, 2.0, 1.0),
+            f("value", "明度", 0.0, 2.0, 1.0),
+        ],
+        true,
+        r#"
+fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> {
+    let src = in_at(0u, px);
+    var h = pn_rgb2hsv(clamp(src.rgb, vec3<f32>(0.0), vec3<f32>(1.0)));
+    h.x = fract(h.x + P[0].x);
+    h.y = clamp(h.y * P[1].x, 0.0, 1.0);
+    h.z = clamp(h.z * P[2].x, 0.0, 1.0);
+    return vec4<f32>(pn_hsv2rgb(h), src.a);
+}
+"#,
+    )
+}
+
+fn crop() -> NodeDef {
+    def(
+        "crop",
+        "Crop",
+        Category::Transform,
+        SURF_IN,
+        vec![
+            int("x", "X", 0, 2048, 0),
+            int("y", "Y", 0, 2048, 0),
+            int("width", "寬", 1, 2048, 32),
+            int("height", "高", 1, 2048, 32),
+            choice("place", "放置", &["保留原位", "移到左上"], 0),
+        ],
+        true,
+        r#"
+fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> {
+    let o = vec2<u32>(u32(P[0].x), u32(P[1].x));
+    let s = vec2<u32>(u32(P[2].x), u32(P[3].x));
+    if (i32(P[4].x) == 1) {
+        if (any(px >= s)) { return vec4<f32>(0.0); }
+        let q = px + o;
+        if (any(q >= SIZE)) { return vec4<f32>(0.0); }
+        return in_at(0u, q);
+    }
+    if (any(px < o) || any(px >= o + s)) { return vec4<f32>(0.0); }
+    return in_at(0u, px);
 }
 "#,
     )
@@ -476,6 +576,97 @@ fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> {
     var v = select(pn_luma(m.rgb) * m.a, m.a, i32(P[0].x) == 1);
     if (i32(P[1].x) == 1) { v = 1.0 - v; }
     return vec4<f32>(src.rgb, src.a * v);
+}
+"#,
+    )
+}
+
+fn composite() -> NodeDef {
+    def(
+        "composite",
+        "Composite",
+        Category::Composite,
+        &[PortDef { name: "bg", ty: DataType::Surface }, PortDef { name: "fg", ty: DataType::Surface }],
+        vec![
+            int("x", "X", -2048, 2048, 0),
+            int("y", "Y", -2048, 2048, 0),
+            int("scale", "整數倍率", 1, 16, 1),
+            f("opacity", "不透明度", 0.0, 1.0, 1.0),
+        ],
+        true,
+        r#"
+fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> {
+    let bg = in_at(0u, px);
+    let s = max(i32(P[2].x), 1);
+    let q = (vec2<i32>(px) - vec2<i32>(i32(P[0].x), i32(P[1].x)));
+    if (any(q < vec2<i32>(0))) { return bg; }
+    let src = q / s;
+    if (!pn_inside(src, SIZE)) { return bg; }
+    let fg = in_at(1u, vec2<u32>(src));
+    let a = fg.a * P[3].x;
+    return vec4<f32>(mix(bg.rgb, fg.rgb, a), a + bg.a * (1.0 - a));
+}
+"#,
+    )
+}
+
+fn pixel_sort() -> NodeDef {
+    def(
+        "pixel_sort",
+        "Pixel Sort",
+        Category::Filter,
+        SURF_IN,
+        vec![
+            choice("direction", "方向", &["橫向", "縱向"], 0),
+            choice("order", "順序", &["暗→亮", "亮→暗"], 0),
+            f("low", "亮度下限", 0.0, 1.0, 0.25),
+            f("high", "亮度上限", 0.0, 1.0, 1.0),
+        ],
+        false,
+        r#"
+fn key(c: vec4<f32>) -> u32 {
+    return u32(clamp(pn_luma(c.rgb), 0.0, 1.0) * 255.0 + 0.5);
+}
+fn sel(c: vec4<f32>) -> bool {
+    let l = pn_luma(c.rgb);
+    return l >= P[2].x && l <= P[3].x;
+}
+fn at(line: u32, i: u32) -> vec4<f32> {
+    if (i32(P[0].x) == 1) { return in_at(0u, vec2<u32>(line, i)); }
+    return in_at(0u, vec2<u32>(i, line));
+}
+// 只排序亮度落在 [下限, 上限] 的連續區段。以 256 級亮度做穩定的計數排序：
+// 每個像素 O(區段長 + 256)，不需要跨執行緒同步。
+fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> {
+    let vertical = i32(P[0].x) == 1;
+    let line = select(px.y, px.x, vertical);
+    let pos = select(px.x, px.y, vertical);
+    let len = select(SIZE.x, SIZE.y, vertical);
+    let me = at(line, pos);
+    if (!sel(me)) { return me; }
+    var s = pos;
+    while (s > 0u && sel(at(line, s - 1u))) { s -= 1u; }
+    var e = pos + 1u;
+    while (e < len && sel(at(line, e))) { e += 1u; }
+    var hist: array<u32, 256>;
+    for (var i = s; i < e; i++) { hist[key(at(line, i))] += 1u; }
+    var k = pos - s;
+    if (i32(P[1].x) == 1) { k = e - 1u - pos; }
+    var bucket = 0u;
+    var before = 0u;
+    for (var b = 0u; b < 256u; b++) {
+        if (before + hist[b] > k) { bucket = b; break; }
+        before += hist[b];
+    }
+    var nth = k - before;
+    for (var i = s; i < e; i++) {
+        let c = at(line, i);
+        if (key(c) == bucket) {
+            if (nth == 0u) { return c; }
+            nth -= 1u;
+        }
+    }
+    return me;
 }
 "#,
     )

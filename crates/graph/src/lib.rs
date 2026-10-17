@@ -52,6 +52,8 @@ pub enum Value {
     Color([f32; 4]),
     /// 列舉型參數，存選項索引。
     Enum(u32),
+    /// 檔案路徑、程式碼等文字參數（不進 GPU 參數區）。
+    Text(String),
 }
 
 impl Value {
@@ -64,6 +66,7 @@ impl Value {
             Value::Vec2([x, y]) => [x, y, 0.0, 0.0],
             Value::Color(c) => c,
             Value::Enum(e) => [e as f32, 0.0, 0.0, 0.0],
+            Value::Text(_) => [0.0; 4],
         }
     }
 }

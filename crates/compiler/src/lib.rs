@@ -8,7 +8,7 @@
 //! 參數一律走 storage buffer，WGSL 只依「子圖結構」生成，[`Kernel::shader_key`]
 //! 相同就共用已編譯的 pipeline，改參數不重編。
 
-use pixelnode_graph::{Graph, NodeId};
+use pixelnode_graph::{Graph, NodeId, Value};
 use pixelnode_nodes::{COMMON_WGSL, MAX_INPUTS, MAX_PARAMS, NodeDef};
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -70,6 +70,8 @@ pub struct Step {
     pub hash: u64,
     /// 自身或上游有 keyframe / 與時間相關 → 輸出會隨影格變化。
     pub animated: bool,
+    /// 第一個文字參數（例如圖片路徑、自訂程式碼）。
+    pub text: Option<String>,
 }
 
 /// kernel 內某成員的某個輸入從哪裡來。
@@ -296,8 +298,13 @@ fn schedule(
             || inputs.iter().flatten().any(|&i| steps[i].animated);
 
         let mut params = [[0.0f32; 4]; MAX_PARAMS];
+        let mut text = None;
         for (slot, p) in params.iter_mut().zip(&def.params) {
-            *slot = node.param_at(p.name, *frame).unwrap_or_else(|| p.default.clone()).to_vec4();
+            let v = node.param_at(p.name, *frame).unwrap_or_else(|| p.default.clone());
+            if let (Value::Text(t), None) = (&v, &text) {
+                text = Some(t.clone());
+            }
+            *slot = v.to_vec4();
         }
 
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -313,8 +320,9 @@ fn schedule(
         for i in inputs {
             i.map(|i| steps[i].hash).hash(&mut h);
         }
+        text.hash(&mut h);
 
-        steps.push(Step { node: id, def, inputs, params, hash: h.finish(), animated });
+        steps.push(Step { node: id, def, inputs, params, hash: h.finish(), animated, text });
         let idx = steps.len() - 1;
         marks.insert(id, Mark::Done(idx));
         Ok(idx)

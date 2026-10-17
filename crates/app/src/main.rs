@@ -174,6 +174,14 @@ impl SnarlViewer<NodeData> for Viewer<'_> {
                                     }
                                 });
                         }
+                        (Value::Text(t), ParamKind::Text { multiline }) => {
+                            let edit = if multiline {
+                                egui::TextEdit::multiline(t).code_editor().desired_rows(6).desired_width(320.0)
+                            } else {
+                                egui::TextEdit::singleline(t).desired_width(180.0)
+                            };
+                            ui.add(edit);
+                        }
                         _ => {
                             ui.weak("（型別不符）");
                         }

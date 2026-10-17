@@ -23,6 +23,7 @@ pub enum ParamKind {
     Int { min: i32, max: i32 },
     Color,
     Enum(&'static [&'static str]),
+    Text { multiline: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -84,7 +85,7 @@ impl NodeDef {
 }
 
 /// 每個節點最多可用的參數槽位數（對應 uniform 中的 `array<vec4<f32>, MAX_PARAMS>`）。
-pub const MAX_PARAMS: usize = 8;
+pub const MAX_PARAMS: usize = 16;
 /// 每個節點最多的輸入數。
 pub const MAX_INPUTS: usize = 2;
 
@@ -133,7 +134,9 @@ pub fn registry() -> &'static [NodeDef] {
                 "solid" | "output" | "checker" | "mirror" | "posterize" => 1,
                 "noise" => 40,
                 "blur" | "outline" => 25,
-                "color_adjust" | "dither" | "palette_map" => 4,
+                "color_adjust" | "dither" | "hsv" => 4,
+                "palette_map" => 10,
+                "pixel_sort" => 60,
                 _ => 3,
             };
         }
@@ -369,11 +372,12 @@ mod tests {
                         | (ParamKind::Int { .. }, Value::Int(_))
                         | (ParamKind::Color, Value::Color(_))
                         | (ParamKind::Enum(_), Value::Enum(_))
+                        | (ParamKind::Text { .. }, Value::Text(_))
                 );
                 assert!(ok, "{}.{} 預設值型別不符", d.kind, p.name);
             }
         }
-        assert!(reg.len() >= 20);
+        assert!(reg.len() >= 24);
         let mut kinds: Vec<_> = reg.iter().map(|d| d.kind).collect();
         kinds.sort_unstable();
         kinds.dedup();
