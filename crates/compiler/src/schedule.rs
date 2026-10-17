@@ -7,6 +7,11 @@ use pixelnode_nodes::{EvalCtx, MAX_INPUTS, MAX_PARAMS, NodeDef, convert};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
+/// 自訂 WGSL 用到 `frame` 才視為隨時間變化，否則照常跨影格快取。
+fn custom_uses_frame(def: &NodeDef, text: Option<&str>) -> bool {
+    def.kind == "custom" && text.is_some_and(|t| t.contains("frame"))
+}
+
 #[derive(Clone, Copy)]
 enum Mark {
     Visiting,
@@ -122,6 +127,7 @@ impl<'a> Scheduler<'a> {
             *slot = v.to_vec4();
         }
         let animated = !def.time_invariant
+            || custom_uses_frame(def, text.as_deref())
             || params_animated
             || inputs.iter().flatten().any(|&i| self.steps[i].animated);
 
@@ -143,7 +149,7 @@ impl<'a> Scheduler<'a> {
         def.kind.hash(&mut h);
         self.canvas.hash(&mut h);
         // 與時間無關的節點不把影格納入 hash：參數值相同就跨影格共用快取。
-        if !def.time_invariant {
+        if !def.time_invariant || custom_uses_frame(def, text.as_deref()) {
             self.frame.hash(&mut h);
         }
         for v in params.iter().flatten() {

@@ -77,7 +77,8 @@ pub struct Runtime {
     queue: wgpu::Queue,
     layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
-    pipelines: HashMap<u64, wgpu::ComputePipeline>,
+    /// shader_key → pipeline；編譯失敗（自訂 WGSL 寫錯）時存錯誤訊息，不讓程式崩潰。
+    pipelines: HashMap<u64, Result<wgpu::ComputePipeline, String>>,
     dummy: wgpu::TextureView,
     info: wgpu::Buffer,
     params: wgpu::Buffer,
@@ -341,6 +342,7 @@ impl Runtime {
 
             if !self.pipelines.contains_key(&kernel.shader_key) {
                 self.stats.compiled += 1;
+                let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
                 let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("fused-kernel"),
                     source: wgpu::ShaderSource::Wgsl(plan.kernel_wgsl(ki).into()),
@@ -353,7 +355,24 @@ impl Runtime {
                     compilation_options: Default::default(),
                     cache: None,
                 });
-                self.pipelines.insert(kernel.shader_key, pipeline);
+                let result = match pollster::block_on(scope.pop()) {
+                    None => Ok(pipeline),
+                    Some(e) => Err(shader_error_summary(&e.to_string())),
+                };
+                self.pipelines.insert(kernel.shader_key, result);
+            }
+            if let Err(e) = &self.pipelines[&kernel.shader_key] {
+                // 失敗的 kernel 輸出透明，錯誤以警告回報。
+                self.warnings.push(e.clone());
+                let out = self.pool.acquire(&self.device, w, h);
+                self.queue.write_texture(
+                    out.as_image_copy(),
+                    &vec![0u8; (w * h * 4) as usize],
+                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
+                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                );
+                outputs.push(out);
+                continue;
             }
 
             let out = self.pool.acquire(&self.device, w, h);
@@ -398,7 +417,7 @@ impl Runtime {
         {
             let mut pass = encoder.begin_compute_pass(&Default::default());
             for (key, bind) in &binds {
-                pass.set_pipeline(&self.pipelines[key]);
+                pass.set_pipeline(self.pipelines[key].as_ref().expect("failed kernels are not dispatched"));
                 pass.set_bind_group(0, bind, &[]);
                 pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
             }
@@ -465,6 +484,19 @@ impl Runtime {
         readback.unmap();
         Image { width: w, height: h, rgba }
     }
+}
+
+/// 從 naga 的長訊息擷取重點（錯誤標題 + 出錯那行）。
+fn shader_error_summary(msg: &str) -> String {
+    let lines: Vec<&str> = msg.lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).collect();
+    let head = lines.iter().find(|l| l.contains("error")).copied().unwrap_or("shader 編譯失敗");
+    let code: Vec<&str> = lines.iter().filter(|l| l.contains('│') && l.contains('^')).copied().take(2).collect();
+    let mut out = format!("WGSL 編譯失敗：{}", head.trim());
+    for c in code {
+        out.push('\n');
+        out.push_str(c.trim());
+    }
+    out.chars().take(400).collect()
 }
 
 fn create_param_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
@@ -648,6 +680,23 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         rt.execute(&plan, 0);
         assert_eq!(rt.warnings.len(), 1, "缺檔應回報警告而非崩潰");
+    }
+
+    #[test]
+    fn custom_wgsl_runs_and_bad_code_does_not_crash() {
+        let Ok(mut rt) = Runtime::new() else { return };
+        let mut c = n(1, "custom");
+        c.params.insert("code".into(), Value::Text("return vec4<f32>(p1, uv.x * 0.0, 1.0, 1.0);".into()));
+        c.params.insert("p1".into(), Value::Float(1.0));
+        let mut g = Graph { canvas: [4, 4], nodes: vec![c, n(2, "output")], links: vec![link(1, 2, 0)], ..Default::default() };
+        let img = rt.execute(&compile(&g).unwrap(), 0);
+        assert_eq!(&img.rgba[..4], &[255, 0, 255, 255]);
+        assert!(rt.warnings.is_empty());
+
+        g.nodes[0].params.insert("code".into(), Value::Text("return oops;".into()));
+        let img = rt.execute(&compile(&g).unwrap(), 0);
+        assert!(img.rgba.iter().all(|&v| v == 0));
+        assert!(rt.warnings[0].contains("WGSL"), "{:?}", rt.warnings);
     }
 
     #[test]

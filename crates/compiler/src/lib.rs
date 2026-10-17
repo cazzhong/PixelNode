@@ -161,7 +161,13 @@ impl Plan {
                 let _ = writeln!(src, "    if (k == {k}u) {{ return {expr}; }}");
             }
             src.push_str("    return vec4<f32>(0.0);\n}\n");
-            src.push_str(&instantiate(def.wgsl, &prefix, member.param_offset));
+            let step = &self.steps[member.step];
+            let body = if def.kind == "custom" {
+                custom_wgsl(step.text.as_deref().unwrap_or("return vec4<f32>(0.0);"))
+            } else {
+                def.wgsl.to_string()
+            };
+            src.push_str(&instantiate(&body, &prefix, member.param_offset));
             src.push('\n');
         }
 
@@ -176,6 +182,18 @@ impl Plan {
         );
         src
     }
+}
+
+/// 自訂 WGSL 節點：使用者只寫函式內容，這裡補上可用的變數。
+pub fn custom_wgsl(user: &str) -> String {
+    format!(
+        "fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> {{\n\
+         \x20   let a = in_at(0u, px);\n    let b = in_at(1u, px);\n\
+         \x20   let p1 = P[0].x; let p2 = P[1].x; let p3 = P[2].x; let p4 = P[3].x;\n\
+         \x20   let c1 = P[4]; let c2 = P[5];\n\
+         \x20   let frame = f32(FRAME); let size = vec2<f32>(SIZE);\n\
+         {user}\n}}\n"
+    )
 }
 
 /// 把節點片段實例化：頂層函式加前綴、參數改讀 storage buffer 的對應位置。
@@ -333,6 +351,9 @@ fn build_kernels(steps: &[Step], root: &[bool]) -> Result<Vec<Kernel>, usize> {
             let param_offset = params.len();
             params.extend_from_slice(&step.params[..step.def.params.len()]);
             step.def.kind.hash(&mut key);
+            if step.def.kind == "custom" {
+                step.text.hash(&mut key);
+            }
             inputs.hash(&mut key);
             members.push(Member { step: s, inputs, param_offset });
         }

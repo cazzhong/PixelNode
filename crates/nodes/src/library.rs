@@ -29,6 +29,7 @@ pub(crate) fn all() -> Vec<NodeDef> {
         composite(),
         pixel_sort(),
         image(),
+        custom(),
     ]
 }
 
@@ -689,6 +690,34 @@ fn image() -> NodeDef {
             choice("fit", "貼合", &["原尺寸置中", "整數縮放置中", "拉伸", "左上原尺寸"], 1),
         ],
         // 由 runtime 直接上傳 texture，不跑 shader；永遠是融合邊界。
+        false,
+        "fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(0.0); }",
+    )
+}
+
+pub const CUSTOM_DEFAULT: &str = "// 可用：a, b（輸入顏色）、uv、px、size、frame、p1–p4、c1、c2\n// 必須 return vec4<f32>\nlet d = length(uv - 0.5);\nlet ring = step(abs(sin(d * 40.0 * p1 - frame * 0.3)), 0.5);\nreturn mix(c1, c2, ring);";
+
+fn custom() -> NodeDef {
+    def(
+        "custom",
+        "Custom WGSL",
+        Category::Filter,
+        &[PortDef { name: "a", ty: DataType::Surface }, PortDef { name: "b", ty: DataType::Surface }],
+        vec![
+            f("p1", "p1", -10.0, 10.0, 1.0),
+            f("p2", "p2", -10.0, 10.0, 0.0),
+            f("p3", "p3", -10.0, 10.0, 0.0),
+            f("p4", "p4", -10.0, 10.0, 0.0),
+            color("c1", "c1", [0.1, 0.1, 0.2, 1.0]),
+            color("c2", "c2", [1.0, 0.8, 0.3, 1.0]),
+            crate::ParamDef {
+                name: "code",
+                label: "程式碼",
+                kind: crate::ParamKind::Text { multiline: true },
+                default: pixelnode_graph::Value::Text(CUSTOM_DEFAULT.to_string()),
+            },
+        ],
+        // 使用者程式碼可能多次取樣輸入，不融合上游以免重複計算。
         false,
         "fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(0.0); }",
     )
