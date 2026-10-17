@@ -627,7 +627,7 @@ mod tests {
     #[test]
     fn every_node_fused_matches_unfused() {
         let Ok(mut rt) = Runtime::new() else { return };
-        for def in pixelnode_nodes::registry().iter().filter(|d| !matches!(d.kind, "output" | "image")) {
+        for def in pixelnode_nodes::registry().iter().filter(|d| !matches!(d.kind, "output" | "image") && !pixelnode_nodes::STRUCTURAL.contains(&d.kind)) {
             let mut checker = n(2, "checker");
             checker.params.insert("size".into(), Value::Int(3));
             let mut x = n(3, def.kind);

@@ -15,7 +15,9 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 
+mod flatten;
 mod schedule;
+pub use flatten::{MAX_DEPTH as MAX_SUBGRAPH_DEPTH, MAX_ITERATIONS as MAX_LOOP_ITERATIONS};
 
 /// 單一 kernel 最多可讀取的輸入 texture 數。
 pub const MAX_KERNEL_TEXTURES: usize = 8;
@@ -32,6 +34,7 @@ pub enum CompileError {
     TypeMismatch { to: NodeId, port: usize },
     BadPort { node: NodeId, port: usize },
     NoOutput,
+    Subgraph(String),
 }
 
 impl std::fmt::Display for CompileError {
@@ -42,6 +45,7 @@ impl std::fmt::Display for CompileError {
             CompileError::TypeMismatch { to, port } => write!(f, "型別不符：節點 {} 輸入 {port}", to.0),
             CompileError::BadPort { node, port } => write!(f, "無效的 port：節點 {} #{port}", node.0),
             CompileError::NoOutput => write!(f, "圖中沒有 Output 節點"),
+            CompileError::Subgraph(m) => write!(f, "子圖錯誤：{m}"),
         }
     }
 }
@@ -247,6 +251,13 @@ pub fn compile(graph: &Graph) -> Result<Plan, CompileError> {
 }
 
 pub fn compile_with(graph: &Graph, opts: CompileOptions) -> Result<Plan, CompileError> {
+    let flat;
+    let graph = if flatten::needs_flatten(graph) {
+        flat = flatten::flatten(graph)?;
+        &flat
+    } else {
+        graph
+    };
     let defs: HashMap<&'static str, &'static NodeDef> =
         pixelnode_nodes::registry().iter().map(|d| (d.kind, d)).collect();
     let def_of = |id: NodeId| -> Result<&'static NodeDef, CompileError> {

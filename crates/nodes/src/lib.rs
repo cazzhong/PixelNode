@@ -9,6 +9,8 @@
 
 mod library;
 mod math;
+mod structure;
+pub use structure::STRUCTURAL;
 
 use pixelnode_graph::{DataType, Value};
 
@@ -25,6 +27,8 @@ pub enum ParamKind {
     Color,
     Enum(&'static [&'static str]),
     Text { multiline: bool },
+    /// 由編譯器寫入的內部值：不顯示、不可接線。
+    Internal,
 }
 
 #[derive(Debug, Clone)]
@@ -43,17 +47,19 @@ pub enum Category {
     Color,
     Composite,
     Math,
+    Structure,
     Output,
 }
 
 impl Category {
-    pub const ALL: [Category; 7] = [
+    pub const ALL: [Category; 8] = [
         Category::Generate,
         Category::Transform,
         Category::Filter,
         Category::Color,
         Category::Composite,
         Category::Math,
+        Category::Structure,
         Category::Output,
     ];
 
@@ -65,6 +71,7 @@ impl Category {
             Category::Color => "顏色",
             Category::Composite => "合成",
             Category::Math => "數學",
+            Category::Structure => "結構",
             Category::Output => "輸出",
         }
     }
@@ -207,6 +214,7 @@ pub fn registry() -> &'static [NodeDef] {
         let mut v = vec![solid(), noise(), color_adjust(), blend(), output()];
         v.extend(library::all());
         v.extend(math::all());
+        v.extend(structure::all());
         for d in &mut v {
             d.cost = match d.kind {
                 "solid" | "output" | "checker" | "mirror" | "posterize" => 1,
@@ -457,11 +465,12 @@ mod tests {
                         | (ParamKind::Color, Value::Color(_))
                         | (ParamKind::Enum(_), Value::Enum(_))
                         | (ParamKind::Text { .. }, Value::Text(_))
+                        | (ParamKind::Internal, _)
                 );
                 assert!(ok, "{}.{} 預設值型別不符", d.kind, p.name);
             }
         }
-        assert!(reg.len() >= 29);
+        assert!(reg.len() >= 36);
         let mut kinds: Vec<_> = reg.iter().map(|d| d.kind).collect();
         kinds.sort_unstable();
         kinds.dedup();

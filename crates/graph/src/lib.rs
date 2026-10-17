@@ -110,6 +110,9 @@ pub struct Graph {
     /// v2 新增；v1 檔案讀入時使用預設值。
     #[serde(default)]
     pub timeline: Timeline,
+    /// 子圖定義（名稱 → 圖），由 Subgraph / Loop 節點以名稱引用。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub subgraphs: BTreeMap<String, Graph>,
 }
 
 impl Default for Graph {
@@ -120,6 +123,7 @@ impl Default for Graph {
             nodes: Vec::new(),
             links: Vec::new(),
             timeline: Timeline::default(),
+            subgraphs: BTreeMap::new(),
         }
     }
 }

@@ -1,6 +1,7 @@
 //! PixelNode 編輯器：節點畫布 + 即時預覽 + 時間軸。
 
 mod history;
+mod subgraphs;
 mod timeline;
 
 use eframe::egui;
@@ -12,6 +13,7 @@ use pixelnode_nodes::{Category, NodeDef, ParamKind};
 use pixelnode_runtime::export::{ExportKind, ExportSpec};
 use pixelnode_runtime::worker::{EvalResult, Evaluator, Job, Message, Preview};
 use std::collections::{BTreeMap, HashMap};
+
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodeData {
@@ -50,6 +52,7 @@ struct Viewer<'a> {
     defs: &'a HashMap<String, NodeDef>,
     history: &'a mut History,
     frame: u32,
+    subgraph_names: &'a [String],
 }
 
 const KEY_ON: egui::Color32 = egui::Color32::from_rgb(0xf5, 0xc5, 0x42);
@@ -175,6 +178,9 @@ impl SnarlViewer<NodeData> for Viewer<'_> {
                     .param_port_of(pi)
                     .and_then(|port| inputs.get(port))
                     .is_some_and(|pin| !pin.remotes.is_empty());
+                if matches!(p.kind, ParamKind::Internal) {
+                    continue;
+                }
                 if linked {
                     ui.horizontal(|ui| {
                         ui.add_space(18.0);
@@ -206,6 +212,17 @@ impl SnarlViewer<NodeData> for Viewer<'_> {
                                 .show_ui(ui, |ui| {
                                     for (i, o) in opts.iter().enumerate() {
                                         ui.selectable_value(e, i as u32, *o);
+                                    }
+                                });
+                        }
+                        (Value::Text(t), ParamKind::Text { .. })
+                            if p.name == "name" && matches!(def.kind, "subgraph" | "loop") =>
+                        {
+                            egui::ComboBox::from_id_salt((node, "subgraph"))
+                                .selected_text(if t.is_empty() { "（選擇）" } else { t.as_str() })
+                                .show_ui(ui, |ui| {
+                                    for n in self.subgraph_names {
+                                        ui.selectable_value(t, n.clone(), n);
                                     }
                                 });
                         }
@@ -403,7 +420,11 @@ impl PreviewTex {
 }
 
 struct App {
+    /// 正在編輯的圖（根圖或某個子圖）；其他圖暫存在 `parked`。
     snarl: Snarl<NodeData>,
+    editing: Option<String>,
+    parked: BTreeMap<Option<String>, subgraphs::Parked>,
+    rename_buf: String,
     style: SnarlStyle,
     defs: HashMap<String, NodeDef>,
     history: History,
@@ -435,6 +456,9 @@ impl App {
             .map(|rs| (rs.device.clone(), rs.queue.clone(), rs.adapter.get_info().name));
         Self {
             snarl: default_snarl(),
+            editing: None,
+            parked: BTreeMap::new(),
+            rename_buf: String::new(),
             style: SnarlStyle { collapsible: Some(true), ..SnarlStyle::new() },
             defs: pixelnode_nodes::registry().iter().map(|d| (d.kind.to_string(), d.clone())).collect(),
             history: History::default(),
@@ -470,11 +494,10 @@ impl App {
             .and_then(|s| Graph::from_json(&s).map_err(|e| e.to_string()));
         match result {
             Ok(g) => {
-                self.snarl = graph_to_snarl(&g);
+                self.set_graph(&g);
                 self.canvas = g.canvas;
                 self.timeline = g.timeline;
                 self.frame = 0;
-                self.history.clear();
                 self.status = format!("已載入 {}", self.path);
             }
             Err(e) => self.status = format!("載入失敗：{e}"),
@@ -538,10 +561,6 @@ impl App {
                 }
             }
         }
-    }
-
-    fn graph(&self) -> Graph {
-        snarl_to_graph(&self.snarl, self.canvas, self.timeline)
     }
 
     fn submit_if_changed(&mut self) {
@@ -662,8 +681,8 @@ impl eframe::App for App {
         egui::Panel::top("top").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("新建").clicked() {
+                    self.set_graph(&Graph::default());
                     self.snarl = default_snarl();
-                    self.history.clear();
                 }
                 ui.add(egui::TextEdit::singleline(&mut self.path).desired_width(240.0));
                 if ui.button("儲存").clicked() {
@@ -698,9 +717,14 @@ impl eframe::App for App {
 
         egui::Panel::bottom("timeline").show(ui, |ui| self.timeline_panel(ui));
         egui::Panel::right("preview").default_size(360.0).show(ui, |ui| self.preview_panel(ui));
+        egui::Panel::left("subgraphs").default_size(190.0).show(ui, |ui| self.subgraph_panel(ui));
 
         egui::CentralPanel::default().show(ui, |ui| {
-            let mut viewer = Viewer { defs: &self.defs, history: &mut self.history, frame: self.frame };
+            let names = self.subgraph_names();
+            if let Some(n) = &self.editing {
+                ui.colored_label(egui::Color32::from_rgb(0x8c, 0xc8, 0xff), format!("正在編輯子圖：{n}"));
+            }
+            let mut viewer = Viewer { defs: &self.defs, history: &mut self.history, frame: self.frame, subgraph_names: &names };
             SnarlWidget::new().id(graph_id()).style(self.style).show(&mut self.snarl, &mut viewer, ui);
         });
 
