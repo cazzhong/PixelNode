@@ -111,6 +111,7 @@ pub struct Kernel {
 #[derive(Debug, Clone)]
 pub struct Plan {
     pub canvas: [u32; 2],
+    pub timeline: pixelnode_graph::Timeline,
     pub steps: Vec<Step>,
     /// 依相依順序；最後一個輸出即 Output。
     pub kernels: Vec<Kernel>,
@@ -126,7 +127,7 @@ impl Plan {
         let kernel = &self.kernels[k];
         let mut src = String::new();
         src.push_str(
-            "struct Info { size: vec4<u32> };\n\
+            "struct Info { size: vec4<u32>, time: vec4<u32> };\n\
              struct Params { p: array<vec4<f32>> };\n\
              @group(0) @binding(0) var<uniform> U: Info;\n\
              @group(0) @binding(1) var<storage, read> PB: Params;\n",
@@ -220,6 +221,8 @@ fn instantiate(wgsl: &str, prefix: &str, param_offset: usize) -> String {
                 "in_at" => out.push_str(&format!("{prefix}in")),
                 "SIZE" => out.push_str("U.size.xy"),
                 "FRAME" => out.push_str("U.size.z"),
+                "FPS" => out.push_str("U.time.x"),
+                "FRAMES" => out.push_str("U.time.y"),
                 w if fns.contains(&w) => {
                     out.push_str(prefix);
                     out.push_str(w);
@@ -266,7 +269,7 @@ pub fn compile_with(graph: &Graph, opts: CompileOptions) -> Result<Plan, Compile
     sched.visit(out_id)?;
     let steps = sched.steps;
     let kernels = fuse(&steps, opts);
-    Ok(Plan { canvas: graph.canvas, steps, kernels })
+    Ok(Plan { canvas: graph.canvas, timeline: graph.timeline, steps, kernels })
 }
 
 fn fuse(steps: &[Step], opts: CompileOptions) -> Vec<Kernel> {

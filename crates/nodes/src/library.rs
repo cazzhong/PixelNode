@@ -30,6 +30,7 @@ pub(crate) fn all() -> Vec<NodeDef> {
         pixel_sort(),
         image(),
         custom(),
+        particles(),
     ]
 }
 
@@ -721,4 +722,78 @@ fn custom() -> NodeDef {
         false,
         "fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(0.0); }",
     )
+}
+
+fn particles() -> NodeDef {
+    NodeDef {
+        time_invariant: false,
+        ..def(
+            "particles",
+            "Particles",
+            Category::Generate,
+            &[],
+            vec![
+                int("count", "數量", 1, 2048, 200),
+                int("seed", "種子", 0, 9999, 1),
+                f("x", "發射 X", 0.0, 1.0, 0.5),
+                f("y", "發射 Y", 0.0, 1.0, 0.85),
+                f("area_x", "範圍寬", 0.0, 1.0, 0.1),
+                f("area_y", "範圍高", 0.0, 1.0, 0.0),
+                f("speed", "速度 px/s", 0.0, 400.0, 60.0),
+                f("direction", "方向°", -180.0, 180.0, -90.0),
+                f("spread", "擴散°", 0.0, 360.0, 30.0),
+                f("gravity", "重力 px/s²", -400.0, 400.0, 40.0),
+                f("lifetime", "壽命 s", 0.05, 10.0, 1.5),
+                int("size", "大小", 1, 4, 1),
+                color("start", "初始色", [1.0, 0.85, 0.3, 1.0]),
+                color("end", "結束色", [0.8, 0.1, 0.1, 0.0]),
+                f("drag", "阻力", 0.0, 5.0, 0.5),
+                choice("mode", "時間", &["整段循環", "單次"], 0),
+            ],
+            true,
+            r#"
+// 解析式粒子：位置是年齡的封閉解（含重力與線性阻力），不需保存模擬狀態，
+// 任一影格可直接求值、結果可重現；「整段循環」模式下首尾無縫。
+fn particle_pos(i: u32, age: f32) -> vec2<f32> {
+    let s = vec2<f32>(SIZE);
+    let fi = f32(i);
+    let seed = P[1].x;
+    let origin = vec2<f32>(P[2].x + (pn_hash2(vec2<f32>(fi, 1.0), seed) - 0.5) * P[4].x,
+                           P[3].x + (pn_hash2(vec2<f32>(fi, 2.0), seed) - 0.5) * P[5].x) * s;
+    let ang = radians(P[7].x + (pn_hash2(vec2<f32>(fi, 3.0), seed) - 0.5) * P[8].x);
+    let spd = P[6].x * (0.6 + 0.8 * pn_hash2(vec2<f32>(fi, 4.0), seed));
+    let v0 = vec2<f32>(cos(ang), sin(ang)) * spd;
+    let g = vec2<f32>(0.0, P[9].x);
+    let k = P[14].x;
+    if (k < 1.0e-4) { return origin + v0 * age + 0.5 * g * age * age; }
+    let e = (1.0 - exp(-k * age)) / k;
+    return origin + v0 * e + g / k * (age - e);
+}
+fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> {
+    let fps = max(f32(FPS), 1.0);
+    let period = max(f32(FRAMES), 1.0) / fps;
+    let t = f32(FRAME) / fps;
+    let life = P[10].x;
+    let size = max(i32(P[11].x), 1);
+    let looped = i32(P[15].x) == 0;
+    let p = vec2<i32>(px);
+    var out = vec4<f32>(0.0);
+    let n = u32(P[0].x);
+    for (var i = 0u; i < n; i++) {
+        let spawn = pn_hash2(vec2<f32>(f32(i), 5.0), P[1].x) * period;
+        var age = t - spawn;
+        if (looped) { age = age - floor(age / period) * period; }
+        if (age < 0.0 || age >= life) { continue; }
+        let q = vec2<i32>(floor(particle_pos(i, age) - f32(size - 1) * 0.5));
+        if (all(p >= q) && all(p < q + vec2<i32>(size))) {
+            let c = mix(P[12], P[13], age / life);
+            // 後面的粒子蓋在上面（alpha over）。
+            out = vec4<f32>(mix(out.rgb, c.rgb, c.a), c.a + out.a * (1.0 - c.a));
+        }
+    }
+    return out;
+}
+"#,
+        )
+    }
 }

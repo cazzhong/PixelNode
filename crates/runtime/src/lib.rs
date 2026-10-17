@@ -179,7 +179,7 @@ impl Runtime {
         let dummy = create_texture(&device, 1, 1).create_view(&Default::default());
         let info = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("info"),
-            size: 16,
+            size: 32,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -267,7 +267,8 @@ impl Runtime {
         let [w, h] = plan.canvas;
         self.stats = Stats { kernels: plan.kernels.len(), ..Default::default() };
         self.warnings.clear();
-        self.queue.write_buffer(&self.info, 0, bytemuck::cast_slice(&[w, h, frame, 0]));
+        let tl = plan.timeline;
+        self.queue.write_buffer(&self.info, 0, bytemuck::cast_slice(&[w, h, frame, 0, tl.fps, tl.frames, 0, 0]));
 
         // 參數打包進單一 buffer。
         let mut offsets = Vec::with_capacity(plan.kernels.len());
@@ -697,6 +698,28 @@ mod tests {
         let img = rt.execute(&compile(&g).unwrap(), 0);
         assert!(img.rgba.iter().all(|&v| v == 0));
         assert!(rt.warnings[0].contains("WGSL"), "{:?}", rt.warnings);
+    }
+
+    #[test]
+    fn particles_are_deterministic_and_loop() {
+        let Ok(mut rt) = Runtime::new() else { return };
+        let g = Graph {
+            canvas: [48, 48],
+            nodes: vec![n(1, "particles"), n(2, "output")],
+            links: vec![link(1, 2, 0)],
+            ..Default::default()
+        };
+        let frames = g.timeline.frames;
+        let at = |rt: &mut Runtime, f| {
+            let plan = compile_with(&g, CompileOptions { frame: f, ..Default::default() }).unwrap();
+            rt.clear_cache();
+            rt.execute(&plan, f).rgba
+        };
+        let a = at(&mut rt, 3);
+        assert!(a.as_chunks::<4>().0.iter().any(|p| p[3] > 0), "應該看得到粒子");
+        assert_eq!(a, at(&mut rt, 3), "同一格必須完全相同");
+        assert_ne!(a, at(&mut rt, 4), "粒子應該會動");
+        assert_eq!(at(&mut rt, 0), at(&mut rt, frames), "整段循環：第 0 格 = 第 N 格");
     }
 
     #[test]

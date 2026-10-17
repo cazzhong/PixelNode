@@ -3,7 +3,7 @@
 //! WGSL 片段契約（供執行器包裝，日後供融合器拼接）：
 //! - 定義 `fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32>`。
 //! - 可用 `P[i]`（第 i 個參數，打包為 vec4）、`in_at(k, px)`（第 k 個輸入）、
-//!   `SIZE`（輸出尺寸 vec2<u32>）、`FRAME`（影格 u32）。
+//!   `SIZE`（輸出尺寸 vec2<u32>）、`FRAME`（影格 u32）、`FPS`、`FRAMES`（時間軸設定，u32）。
 //! - 可額外宣告輔助函式（融合時會自動加前綴避免撞名）；共用輔助函式放在 [`COMMON_WGSL`]。
 //! - `in_at` 可在任意位置取樣（例如 Transform）；被融合的上游會在該位置重算。
 
@@ -215,6 +215,7 @@ pub fn registry() -> &'static [NodeDef] {
                 "color_adjust" | "dither" | "hsv" => 4,
                 "palette_map" => 10,
                 "pixel_sort" => 60,
+                "particles" => 200,
                 _ => 3,
             };
         }

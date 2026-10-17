@@ -92,6 +92,37 @@ fn main() {
         rows.push(Row { name, total: t.elapsed(), note: format!("{dispatched} dispatches") });
     }
 
+    // GPU 粒子：2048 顆、每格都不同（與時間相關，無法快取）。
+    let mut pg = pixelnode_graph::Graph { canvas: CANVAS, ..Default::default() };
+    let mut pn = pixelnode_graph::Node {
+        id: pixelnode_graph::NodeId(1),
+        kind: "particles".into(),
+        params: Default::default(),
+        pos: [0.0; 2],
+        anim: Default::default(),
+    };
+    pn.params.insert("count".into(), pixelnode_graph::Value::Int(2048));
+    pg.nodes.push(pn);
+    pg.nodes.push(pixelnode_graph::Node {
+        id: pixelnode_graph::NodeId(2),
+        kind: "output".into(),
+        params: Default::default(),
+        pos: [0.0; 2],
+        anim: Default::default(),
+    });
+    pg.links.push(pixelnode_graph::Link {
+        from_node: pixelnode_graph::NodeId(1),
+        from_port: 0,
+        to_node: pixelnode_graph::NodeId(2),
+        to_port: 0,
+    });
+    rt.run(&compile_with(&pg, fused_opts).unwrap(), 0);
+    let t = Instant::now();
+    for f in 0..FRAMES {
+        rt.run(&compile_with(&pg, CompileOptions { frame: f, ..fused_opts }).unwrap(), f);
+    }
+    rows.push(Row { name: "particles 2048 ×60", total: t.elapsed(), note: "解析式、逐像素收集".into() });
+
     // 拖 slider：每格改一個上游參數，含重新編譯計畫與讀回預覽。
     let mut g = graph.clone();
     let t = Instant::now();
