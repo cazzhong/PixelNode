@@ -481,6 +481,25 @@ impl App {
         }
     }
 
+    /// 把拖進視窗的 PNG 建成 Image In 節點。
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let files = ctx.input(|i| i.raw.dropped_files.clone());
+        let def = pixelnode_nodes::find("image").expect("image node exists");
+        for (k, f) in files.iter().enumerate() {
+            let Some(path) = &f.path else { continue };
+            if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("png")) {
+                self.status = format!("只支援 PNG：{}", path.display());
+                continue;
+            }
+            let mut data = NodeData::new(def);
+            data.params.insert("path".into(), Value::Text(path.to_string_lossy().into_owned()));
+            let pos = egui::pos2(-320.0, 40.0 + k as f32 * 160.0);
+            let id = self.snarl.insert_node(pos, data.clone());
+            self.history.record(Command::AddNode { id, pos, data });
+            self.status = format!("已加入圖片：{}", path.display());
+        }
+    }
+
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         if ctx.text_edit_focused() {
             return;
@@ -618,6 +637,9 @@ impl App {
                 )),
                 Err(e) => ui.colored_label(egui::Color32::LIGHT_RED, e),
             };
+            for w in &res.warnings {
+                ui.colored_label(egui::Color32::from_rgb(0xe8, 0xb0, 0x4c), format!("⚠ {w}"));
+            }
         }
         ui.separator();
         if let Some(tex) = &self.preview {
@@ -634,6 +656,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.handle_shortcuts(&ctx);
+        self.handle_dropped_files(&ctx);
         self.receive(&ctx);
 
         egui::Panel::top("top").show(ui, |ui| {

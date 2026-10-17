@@ -28,6 +28,7 @@ pub(crate) fn all() -> Vec<NodeDef> {
         mask(),
         composite(),
         pixel_sort(),
+        image(),
     ]
 }
 
@@ -669,5 +670,26 @@ fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> {
     return me;
 }
 "#,
+    )
+}
+
+fn image() -> NodeDef {
+    def(
+        "image",
+        "Image In",
+        Category::Generate,
+        &[],
+        vec![
+            crate::ParamDef {
+                name: "path",
+                label: "PNG 路徑",
+                kind: crate::ParamKind::Text { multiline: false },
+                default: pixelnode_graph::Value::Text(String::new()),
+            },
+            choice("fit", "貼合", &["原尺寸置中", "整數縮放置中", "拉伸", "左上原尺寸"], 1),
+        ],
+        // 由 runtime 直接上傳 texture，不跑 shader；永遠是融合邊界。
+        false,
+        "fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> { return vec4<f32>(0.0); }",
     )
 }

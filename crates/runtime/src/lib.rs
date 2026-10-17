@@ -17,6 +17,7 @@ const POOL_BUDGET: u64 = 256 << 20;
 pub const DEFAULT_CACHE_BUDGET: u64 = 512 << 20;
 
 pub mod export;
+pub mod image;
 
 struct CacheEntry {
     tex: wgpu::Texture,
@@ -89,6 +90,9 @@ pub struct Runtime {
     pub cache_budget: u64,
     tick: u64,
     pub stats: Stats,
+    /// 本次執行的非致命問題（例如找不到圖片）。
+    pub warnings: Vec<String>,
+    images: image::ImageCache,
     pub adapter_name: String,
     /// 預覽用 texture：只由 copy 寫入，不進 pool，UI 可安全持有。
     display: Option<wgpu::Texture>,
@@ -199,6 +203,8 @@ impl Runtime {
             cache_budget: DEFAULT_CACHE_BUDGET,
             tick: 0,
             stats: Stats::default(),
+            warnings: Vec::new(),
+            images: image::ImageCache::default(),
             display: None,
         }
     }
@@ -259,6 +265,7 @@ impl Runtime {
     fn encode(&mut self, plan: &Plan, frame: u32) -> (wgpu::CommandEncoder, wgpu::Texture) {
         let [w, h] = plan.canvas;
         self.stats = Stats { kernels: plan.kernels.len(), ..Default::default() };
+        self.warnings.clear();
         self.queue.write_buffer(&self.info, 0, bytemuck::cast_slice(&[w, h, frame, 0]));
 
         // 參數打包進單一 buffer。
@@ -284,15 +291,53 @@ impl Runtime {
         self.tick += 1;
         let tick = self.tick;
         let mut binds = Vec::with_capacity(plan.kernels.len());
+        let mut keys: Vec<u64> = Vec::with_capacity(plan.kernels.len());
 
         for (ki, kernel) in plan.kernels.iter().enumerate() {
-            if let Some(e) = self.cache.get_mut(&kernel.hash) {
+            let root = &plan.steps[kernel.members.last().expect("kernel has members").step];
+            // Image In：檔案修改時間納入快取 key，存檔後自動重新載入。
+            let image_path = (root.def.kind == "image").then(|| root.text.clone().unwrap_or_default());
+            // 上游 key 串接進來，讓圖片更新能往下游傳遞。
+            let key = {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                std::hash::Hash::hash(&kernel.hash, &mut h);
+                for &t in &kernel.textures {
+                    std::hash::Hash::hash(&keys[t], &mut h);
+                }
+                if let Some(p) = &image_path {
+                    std::hash::Hash::hash(&image::mtime(p), &mut h);
+                }
+                std::hash::Hasher::finish(&h)
+            };
+            keys.push(key);
+            if let Some(e) = self.cache.get_mut(&key) {
                 self.stats.cached += 1;
                 e.last_used = tick;
                 outputs.push(e.tex.clone());
                 continue;
             }
             self.stats.dispatched += 1;
+
+            if let Some(path) = image_path {
+                let out = self.pool.acquire(&self.device, w, h);
+                let fitted = match self.images.get(&path) {
+                    Ok(img) => image::fit(img, w, h, root.params[1][0] as u32),
+                    Err(e) => {
+                        self.warnings.push(e);
+                        Image { width: w, height: h, rgba: vec![0; (w * h * 4) as usize] }
+                    }
+                };
+                self.queue.write_texture(
+                    out.as_image_copy(),
+                    &fitted.rgba,
+                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
+                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                );
+                self.cache_bytes += tex_bytes(w, h);
+                self.cache.insert(key, CacheEntry { tex: out.clone(), last_used: tick });
+                outputs.push(out);
+                continue;
+            }
 
             if !self.pipelines.contains_key(&kernel.shader_key) {
                 self.stats.compiled += 1;
@@ -345,7 +390,7 @@ impl Runtime {
             });
             binds.push((kernel.shader_key, bind));
             self.cache_bytes += tex_bytes(w, h);
-            self.cache.insert(kernel.hash, CacheEntry { tex: out.clone(), last_used: tick });
+            self.cache.insert(key, CacheEntry { tex: out.clone(), last_used: tick });
             outputs.push(out);
         }
 
@@ -441,7 +486,8 @@ fn create_texture(device: &wgpu::Device, w: u32, h: u32) -> wgpu::Texture {
         format: FORMAT,
         usage: wgpu::TextureUsages::STORAGE_BINDING
             | wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::COPY_SRC,
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     })
 }
@@ -548,7 +594,7 @@ mod tests {
     #[test]
     fn every_node_fused_matches_unfused() {
         let Ok(mut rt) = Runtime::new() else { return };
-        for def in pixelnode_nodes::registry().iter().filter(|d| d.kind != "output") {
+        for def in pixelnode_nodes::registry().iter().filter(|d| !matches!(d.kind, "output" | "image")) {
             let mut checker = n(2, "checker");
             checker.params.insert("size".into(), Value::Int(3));
             let mut x = n(3, def.kind);
@@ -580,6 +626,28 @@ mod tests {
             assert!(off * 50 <= total, "{}：{off}/{total} 像素不一致", def.kind);
             assert!(a.rgba.iter().any(|&v| v != 0), "{} 輸出全黑", def.kind);
         }
+    }
+
+    #[test]
+    fn image_in_loads_and_reloads() {
+        let Ok(mut rt) = Runtime::new() else { return };
+        let path = std::env::temp_dir().join(format!("pixelnode-imgin-{}.png", std::process::id()));
+        let red = Image { width: 1, height: 1, rgba: vec![255, 0, 0, 255] };
+        export::write_png(&path, &red).unwrap();
+        let mut img = n(1, "image");
+        img.params.insert("path".into(), Value::Text(path.to_string_lossy().into()));
+        img.params.insert("fit".into(), Value::Enum(2));
+        let g = Graph { canvas: [4, 4], nodes: vec![img, n(2, "output")], links: vec![link(1, 2, 0)], ..Default::default() };
+        let plan = compile(&g).unwrap();
+        assert_eq!(&rt.execute(&plan, 0).rgba[..4], &[255, 0, 0, 255]);
+        assert!(rt.warnings.is_empty());
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        export::write_png(&path, &Image { width: 1, height: 1, rgba: vec![0, 0, 255, 255] }).unwrap();
+        assert_eq!(&rt.execute(&plan, 0).rgba[..4], &[0, 0, 255, 255], "檔案更新後應重新載入");
+        let _ = std::fs::remove_file(&path);
+        rt.execute(&plan, 0);
+        assert_eq!(rt.warnings.len(), 1, "缺檔應回報警告而非崩潰");
     }
 
     #[test]

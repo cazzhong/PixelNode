@@ -28,6 +28,7 @@ pub struct EvalResult {
     pub preview: Result<Preview, String>,
     pub elapsed: Duration,
     pub stats: crate::Stats,
+    pub warnings: Vec<String>,
 }
 
 pub struct Evaluator {
@@ -72,6 +73,7 @@ impl Evaluator {
                     let Some((graph, frame)) = latest_eval else { continue };
                     let start = Instant::now();
                     let opts = pixelnode_compiler::CompileOptions { frame, ..Default::default() };
+                    let mut warnings = Vec::new();
                     let (preview, stats) = match &mut runtime {
                         Err(e) => (Err(e.clone()), Default::default()),
                         Ok(rt) => match pixelnode_compiler::compile_with(&graph, opts) {
@@ -83,11 +85,12 @@ impl Evaluator {
                                 } else {
                                     Preview::Cpu(rt.execute(&plan, frame))
                                 };
+                                warnings = std::mem::take(&mut rt.warnings);
                                 (Ok(preview), rt.stats)
                             }
                         },
                     };
-                    let msg = Message::Eval(EvalResult { frame, preview, elapsed: start.elapsed(), stats });
+                    let msg = Message::Eval(EvalResult { frame, preview, elapsed: start.elapsed(), stats, warnings });
                     if res_tx.send(msg).is_err() {
                         return;
                     }
