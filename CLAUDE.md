@@ -46,13 +46,13 @@ benches/     # 效能 benchmark
 ## 型別系統
 Surface、Float、Int、Vec2/3/4、Color、Gradient、Curve、Path、Particle；支援隱式轉換（如 Float→Color）。
 
-## 里程碑
-- **M1 基礎（下一步）**：建 workspace；graph crate；5 個逐像素節點（Noise、Solid、Color Adjust、Blend、Output）；未融合執行器；egui 節點畫布可拖節點、連線、即時預覽 Noise → Color → Output；JSON 存讀檔。
-- **M2 效能核心**：融合編譯器、texture pool、hash 快取、背景求值執行緒、benchmark（目標情境：100 節點、256×256、60 影格），benchmark 進 CI。
-- **M3 動畫**：時間軸、keyframe + 曲線、影格快取、time-invariant、GIF / PNG 序列 / Sprite Sheet 輸出。
-- **M4 擴充**：GPU 粒子、Subgraph、Loop、調色盤工具（量化、dither、palette map）、自訂 WGSL 節點。
+## 里程碑（2026-10-17 全部完成）
+- ✅ **M1 基礎**：workspace、graph crate、逐像素節點、節點畫布、即時預覽、JSON 存讀檔。
+- ✅ **M2 效能核心**：融合編譯器（含便宜共用節點重算、靜態→動態交界落地）、texture pool、hash 快取、背景求值執行緒、benchmark 進 CI。
+- ✅ **M3 動畫**：時間軸、keyframe + 曲線、LRU 影格快取、內容 hash 自動跨影格共用、GIF / PNG 序列 / Sprite Sheet 輸出。
+- ✅ **M4 擴充**：GPU 粒子（解析式）、Subgraph、Loop、調色盤工具（預設調色盤 + dither、palette map）、自訂 WGSL 節點、數學節點與參數連線、Image In。
 
-## 第一批節點清單（約 30 個，M1 後陸續補）
+## 第一批節點清單（已全部實作，見 README）
 - 生成：Solid、Noise（Perlin/Cellular/Simplex）、Gradient、Shape、Checker
 - 變換：Transform、Tile、Mirror、Crop、Scale（nearest）
 - 濾鏡：Blur、Outline、Dither、Posterize、Palette Map、Pixel Sort
@@ -63,4 +63,6 @@ Surface、Float、Int、Vec2/3/4、Color、Gradient、Curve、Path、Particle；
 
 ## 慣例
 - 像素處理一律 point filtering、整數縮放。
-- 效能相關改動需附 benchmark 數據。
+- 效能相關改動需附 benchmark 數據（記錄在 benches/RESULTS.md）。
+- 提交前跑 `bash scripts/check.sh`（clippy -D warnings + 全部測試）。
+- 新節點加進 `crates/nodes`，`every_node_fused_matches_unfused` 測試會自動檢查它能編譯且融合結果一致。

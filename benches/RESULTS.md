@@ -42,3 +42,18 @@
 | slider drag ×60 | 128.79 | 2.146 | 1320 dispatches |
 
 融合加速 1.44× → **2.47×**。
+
+## 2026-10-17 · M4 完成 · RTX 2070
+
+| 情境 | 總計 (ms) | 每格 (ms) | 備註 |
+|---|---:|---:|---|
+| compile+wgsl ×60 | 62.24 | 1.037 | |
+| cold unfused ×60 | 202.51 | 3.375 | 100 kernels |
+| cold fused ×60 | 79.34 | 1.322 | 33 kernels |
+| cached fused ×60 | 2.05 | 0.034 | |
+| animated 1 track, 1st loop ×60 | 40.10 | 0.668 | 254 dispatches |
+| animated 1 track, 2nd loop ×60 | 9.16 | 0.153 | 0 dispatches |
+| particles 2048 ×60 | 284.86 | 4.748 | 解析式、逐像素收集 |
+| slider drag ×60 | 130.13 | 2.169 | 1322 dispatches，0 次 shader 重編 |
+
+融合加速 2.55×。
