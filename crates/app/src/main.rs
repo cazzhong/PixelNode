@@ -8,7 +8,7 @@ use egui_snarl::ui::{PinInfo, SnarlPin, SnarlStyle, SnarlViewer, SnarlWidget, ge
 use egui_snarl::{InPin, InPinId, NodeId, OutPin, OutPinId, Snarl};
 use history::{Command, History};
 use pixelnode_graph::{Graph, Interp, Link, Node, Timeline, Track, Value};
-use pixelnode_nodes::{NodeDef, ParamKind};
+use pixelnode_nodes::{Category, NodeDef, ParamKind};
 use pixelnode_runtime::export::{ExportKind, ExportSpec};
 use pixelnode_runtime::worker::{EvalResult, Evaluator, Job, Message, Preview};
 use std::collections::{BTreeMap, HashMap};
@@ -240,13 +240,17 @@ impl SnarlViewer<NodeData> for Viewer<'_> {
 
     fn show_graph_menu(&mut self, pos: egui::Pos2, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) {
         ui.label("新增節點");
-        for def in pixelnode_nodes::registry() {
-            if ui.button(def.title).clicked() {
-                let data = NodeData::new(def);
-                let id = snarl.insert_node(pos, data.clone());
-                self.history.record(Command::AddNode { id, pos, data });
-                ui.close();
-            }
+        for cat in Category::ALL {
+            ui.menu_button(cat.label(), |ui| {
+                for def in pixelnode_nodes::registry().iter().filter(|d| d.category == cat) {
+                    if ui.button(def.title).clicked() {
+                        let data = NodeData::new(def);
+                        let id = snarl.insert_node(pos, data.clone());
+                        self.history.record(Command::AddNode { id, pos, data });
+                        ui.close();
+                    }
+                }
+            });
         }
     }
 
@@ -676,5 +680,18 @@ mod tests {
         assert_eq!(g, snarl_to_graph(&graph_to_snarl(&g2), [64, 32], tl));
         assert!(g.nodes.iter().any(|n| n.anim.contains_key("phase")));
         assert!(pixelnode_compiler::compile(&g).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod example_tests {
+    #[test]
+    fn bundled_examples_compile() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples");
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let g = pixelnode_graph::Graph::from_json(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            pixelnode_compiler::compile(&g).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        }
     }
 }

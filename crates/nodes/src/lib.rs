@@ -4,7 +4,10 @@
 //! - 定義 `fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32>`。
 //! - 可用 `P[i]`（第 i 個參數，打包為 vec4）、`in_at(k, px)`（第 k 個輸入）、
 //!   `SIZE`（輸出尺寸 vec2<u32>）、`FRAME`（影格 u32）。
-//! - 可額外宣告以 `<kind>_` 為前綴的輔助函式；共用輔助函式放在 [`COMMON_WGSL`]。
+//! - 可額外宣告輔助函式（融合時會自動加前綴避免撞名）；共用輔助函式放在 [`COMMON_WGSL`]。
+//! - `in_at` 可在任意位置取樣（例如 Transform）；被融合的上游會在該位置重算。
+
+mod library;
 
 use pixelnode_graph::{DataType, Value};
 
@@ -30,14 +33,42 @@ pub struct ParamDef {
     pub default: Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Category {
+    Generate,
+    Transform,
+    Filter,
+    Color,
+    Composite,
+    Output,
+}
+
+impl Category {
+    pub const ALL: [Category; 6] =
+        [Category::Generate, Category::Transform, Category::Filter, Category::Color, Category::Composite, Category::Output];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Category::Generate => "生成",
+            Category::Transform => "變換",
+            Category::Filter => "濾鏡",
+            Category::Color => "顏色",
+            Category::Composite => "合成",
+            Category::Output => "輸出",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NodeDef {
     pub kind: &'static str,
     pub title: &'static str,
+    pub category: Category,
     pub inputs: &'static [PortDef],
     pub outputs: &'static [PortDef],
     pub params: Vec<ParamDef>,
-    /// 逐像素節點可被融合；需鄰域 / 全域資訊者為 false。
+    /// 每個輸出像素對每個輸入只取樣一次 → 上游可融合進來重算。
+    /// 需鄰域（Blur / Outline）或全域資訊者為 false，成為融合邊界。
     pub per_pixel: bool,
     /// 與時間無關（動畫中只需算一次）。
     pub time_invariant: bool,
@@ -63,6 +94,19 @@ fn pn_hash2(p: vec2<f32>, seed: f32) -> f32 {
     q = q + dot(q, q.yzx + 33.33);
     return fract((q.x + q.y) * q.z);
 }
+fn pn_luma(c: vec3<f32>) -> f32 {
+    return dot(c, vec3<f32>(0.299, 0.587, 0.114));
+}
+fn pn_inside(p: vec2<i32>, size: vec2<u32>) -> bool {
+    return all(p >= vec2<i32>(0)) && all(p < vec2<i32>(size));
+}
+fn pn_clamp_px(p: vec2<i32>, size: vec2<u32>) -> vec2<u32> {
+    return vec2<u32>(clamp(p, vec2<i32>(0), vec2<i32>(size) - vec2<i32>(1)));
+}
+fn pn_wrap_px(p: vec2<i32>, size: vec2<u32>) -> vec2<u32> {
+    let s = vec2<i32>(size);
+    return vec2<u32>(((p % s) + s) % s);
+}
 fn pn_rgb2hsv(c: vec3<f32>) -> vec3<f32> {
     let k = vec4<f32>(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
     let p = mix(vec4<f32>(c.bg, k.wz), vec4<f32>(c.gb, k.xy), step(c.b, c.g));
@@ -79,7 +123,11 @@ fn pn_hsv2rgb(c: vec3<f32>) -> vec3<f32> {
 
 pub fn registry() -> &'static [NodeDef] {
     static REG: std::sync::OnceLock<Vec<NodeDef>> = std::sync::OnceLock::new();
-    REG.get_or_init(|| vec![solid(), noise(), color_adjust(), blend(), output()])
+    REG.get_or_init(|| {
+        let mut v = vec![solid(), noise(), color_adjust(), blend(), output()];
+        v.extend(library::all());
+        v
+    })
 }
 
 pub fn find(kind: &str) -> Option<&'static NodeDef> {
@@ -90,9 +138,24 @@ fn f(name: &'static str, label: &'static str, min: f32, max: f32, v: f32) -> Par
     ParamDef { name, label, kind: ParamKind::Float { min, max }, default: Value::Float(v) }
 }
 
+fn int(name: &'static str, label: &'static str, min: i32, max: i32, v: i32) -> ParamDef {
+    ParamDef { name, label, kind: ParamKind::Int { min, max }, default: Value::Int(v) }
+}
+
+fn color(name: &'static str, label: &'static str, c: [f32; 4]) -> ParamDef {
+    ParamDef { name, label, kind: ParamKind::Color, default: Value::Color(c) }
+}
+
+fn choice(name: &'static str, label: &'static str, opts: &'static [&'static str], v: u32) -> ParamDef {
+    ParamDef { name, label, kind: ParamKind::Enum(opts), default: Value::Enum(v) }
+}
+
+const SURF_IN: &[PortDef] = &[PortDef { name: "in", ty: DataType::Surface }];
+
 fn solid() -> NodeDef {
     NodeDef {
         kind: "solid",
+        category: Category::Generate,
         title: "Solid",
         inputs: &[],
         outputs: SURF_OUT,
@@ -111,6 +174,7 @@ fn solid() -> NodeDef {
 fn noise() -> NodeDef {
     NodeDef {
         kind: "noise",
+        category: Category::Generate,
         title: "Noise",
         inputs: &[],
         outputs: SURF_OUT,
@@ -193,6 +257,7 @@ fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> {
 fn color_adjust() -> NodeDef {
     NodeDef {
         kind: "color_adjust",
+        category: Category::Color,
         title: "Color Adjust",
         inputs: &[PortDef { name: "in", ty: DataType::Surface }],
         outputs: SURF_OUT,
@@ -222,6 +287,7 @@ fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> {
 fn blend() -> NodeDef {
     NodeDef {
         kind: "blend",
+        category: Category::Composite,
         title: "Blend",
         inputs: &[PortDef { name: "bg", ty: DataType::Surface }, PortDef { name: "fg", ty: DataType::Surface }],
         outputs: SURF_OUT,
@@ -258,6 +324,7 @@ fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> {
 fn output() -> NodeDef {
     NodeDef {
         kind: "output",
+        category: Category::Output,
         title: "Output",
         inputs: &[PortDef { name: "in", ty: DataType::Surface }],
         outputs: &[],
@@ -279,8 +346,20 @@ mod tests {
             assert!(d.params.len() <= MAX_PARAMS, "{}", d.kind);
             assert!(d.inputs.len() <= MAX_INPUTS, "{}", d.kind);
             assert!(d.wgsl.contains("fn node_fn"), "{}", d.kind);
+            for p in &d.params {
+                let ok = matches!(
+                    (p.kind, &p.default),
+                    (ParamKind::Float { .. }, Value::Float(_))
+                        | (ParamKind::Int { .. }, Value::Int(_))
+                        | (ParamKind::Color, Value::Color(_))
+                        | (ParamKind::Enum(_), Value::Enum(_))
+                );
+                assert!(ok, "{}.{} 預設值型別不符", d.kind, p.name);
+            }
         }
+        assert!(reg.len() >= 20);
         let mut kinds: Vec<_> = reg.iter().map(|d| d.kind).collect();
+        kinds.sort_unstable();
         kinds.dedup();
         assert_eq!(kinds.len(), reg.len());
     }

@@ -543,6 +543,45 @@ mod tests {
         assert_eq!(rt.stats.dispatched, 1);
     }
 
+    /// 每種節點都放進「noise / checker → 節點 → color_adjust → output」，
+    /// 檢查 kernel 能編譯，且融合結果與逐節點執行一致。
+    #[test]
+    fn every_node_fused_matches_unfused() {
+        let Ok(mut rt) = Runtime::new() else { return };
+        for def in pixelnode_nodes::registry().iter().filter(|d| d.kind != "output") {
+            let mut checker = n(2, "checker");
+            checker.params.insert("size".into(), Value::Int(3));
+            let mut x = n(3, def.kind);
+            x.params = def.default_params();
+            let mut links = vec![link(3, 4, 0), link(4, 5, 0)];
+            if !def.inputs.is_empty() {
+                links.push(link(1, 3, 0));
+            }
+            if def.inputs.len() > 1 {
+                links.push(link(2, 3, 1));
+            }
+            let g = Graph {
+                canvas: [40, 24],
+                nodes: vec![n(1, "noise"), checker, x, n(4, "color_adjust"), n(5, "output")],
+                links,
+                ..Default::default()
+            };
+            let fused = compile(&g).unwrap();
+            let unfused = compile_with(&g, CompileOptions { fuse: false, ..Default::default() }).unwrap();
+            let a = rt.execute(&fused, 0);
+            rt.clear_cache();
+            let b = rt.execute(&unfused, 0);
+            rt.clear_cache();
+            // 融合後中間值不經 RGBA8 量化；量化類節點（Dither / Posterize）可能有少數像素跨越門檻。
+            let off = a.rgba.as_chunks::<4>().0.iter().zip(b.rgba.as_chunks::<4>().0)
+                .filter(|(p, q)| p.iter().zip(q.iter()).any(|(x, y)| x.abs_diff(*y) > 2))
+                .count();
+            let total = (a.width * a.height) as usize;
+            assert!(off * 50 <= total, "{}：{off}/{total} 像素不一致", def.kind);
+            assert!(a.rgba.iter().any(|&v| v != 0), "{} 輸出全黑", def.kind);
+        }
+    }
+
     #[test]
     fn param_change_reuses_pipeline() {
         let Ok(mut rt) = Runtime::new() else { return };
