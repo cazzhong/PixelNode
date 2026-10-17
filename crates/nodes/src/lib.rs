@@ -8,6 +8,7 @@
 //! - `in_at` 可在任意位置取樣（例如 Transform）；被融合的上游會在該位置重算。
 
 mod library;
+mod math;
 
 use pixelnode_graph::{DataType, Value};
 
@@ -41,12 +42,20 @@ pub enum Category {
     Filter,
     Color,
     Composite,
+    Math,
     Output,
 }
 
 impl Category {
-    pub const ALL: [Category; 6] =
-        [Category::Generate, Category::Transform, Category::Filter, Category::Color, Category::Composite, Category::Output];
+    pub const ALL: [Category; 7] = [
+        Category::Generate,
+        Category::Transform,
+        Category::Filter,
+        Category::Color,
+        Category::Composite,
+        Category::Math,
+        Category::Output,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -55,6 +64,7 @@ impl Category {
             Category::Filter => "濾鏡",
             Category::Color => "顏色",
             Category::Composite => "合成",
+            Category::Math => "數學",
             Category::Output => "輸出",
         }
     }
@@ -76,11 +86,78 @@ pub struct NodeDef {
     /// 每像素相對成本估計（約略 ALU 量），融合器用來決定共用節點要不要重算。
     pub cost: u32,
     pub wgsl: &'static str,
+    /// 數值節點（CPU 求值）：參數已解析（含連線）後計算輸出。有值者不產生 GPU kernel。
+    pub eval: Option<fn(&[Value], &EvalCtx) -> Value>,
+}
+
+/// 數值節點求值時可用的時間資訊。
+#[derive(Debug, Clone, Copy)]
+pub struct EvalCtx {
+    pub frame: u32,
+    pub frames: u32,
+    pub fps: u32,
 }
 
 impl NodeDef {
     pub fn default_params(&self) -> std::collections::BTreeMap<String, Value> {
         self.params.iter().map(|p| (p.name.to_string(), p.default.clone())).collect()
+    }
+
+    pub fn is_value(&self) -> bool {
+        self.eval.is_some()
+    }
+
+    /// 可接線的參數（Float / Int / Color），依序排在 Surface 輸入之後成為輸入 port。
+    /// 回傳 (參數索引, 型別)。
+    pub fn param_ports(&self) -> impl Iterator<Item = (usize, DataType)> + '_ {
+        self.params.iter().enumerate().filter_map(|(i, p)| match p.kind {
+            ParamKind::Float { .. } => Some((i, DataType::Float)),
+            ParamKind::Int { .. } => Some((i, DataType::Int)),
+            ParamKind::Color => Some((i, DataType::Color)),
+            _ => None,
+        })
+    }
+
+    /// 全部輸入 port 數（Surface 輸入 + 參數 port）。
+    pub fn input_count(&self) -> usize {
+        self.inputs.len() + self.param_ports().count()
+    }
+
+    /// 輸入 port 的名稱與型別。
+    pub fn input_port(&self, port: usize) -> Option<(&'static str, DataType)> {
+        if let Some(p) = self.inputs.get(port) {
+            return Some((p.name, p.ty));
+        }
+        let (i, ty) = self.param_ports().nth(port - self.inputs.len())?;
+        Some((self.params[i].label, ty))
+    }
+
+    /// 參數索引 → 對應的輸入 port（若可接線）。
+    pub fn param_port_of(&self, param: usize) -> Option<usize> {
+        self.param_ports().position(|(i, _)| i == param).map(|k| self.inputs.len() + k)
+    }
+}
+
+/// 把連線送來的值轉成參數需要的型別（隱式轉換）。
+pub fn convert(v: &Value, kind: ParamKind) -> Value {
+    let num = |v: &Value| match *v {
+        Value::Float(x) => x,
+        Value::Int(i) => i as f32,
+        Value::Enum(e) => e as f32,
+        Value::Color(c) => 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2],
+        _ => 0.0,
+    };
+    match kind {
+        ParamKind::Float { .. } => Value::Float(num(v)),
+        ParamKind::Int { min, max } => Value::Int((num(v).round() as i32).clamp(min, max)),
+        ParamKind::Color => match *v {
+            Value::Color(c) => Value::Color(c),
+            _ => {
+                let x = num(v);
+                Value::Color([x, x, x, 1.0])
+            }
+        },
+        _ => v.clone(),
     }
 }
 
@@ -129,6 +206,7 @@ pub fn registry() -> &'static [NodeDef] {
     REG.get_or_init(|| {
         let mut v = vec![solid(), noise(), color_adjust(), blend(), output()];
         v.extend(library::all());
+        v.extend(math::all());
         for d in &mut v {
             d.cost = match d.kind {
                 "solid" | "output" | "checker" | "mirror" | "posterize" => 1,
@@ -182,6 +260,7 @@ fn solid() -> NodeDef {
         per_pixel: true,
         time_invariant: true,
         cost: 0,
+        eval: None,
         wgsl: "fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> { return P[0]; }",
     }
 }
@@ -212,6 +291,7 @@ fn noise() -> NodeDef {
         per_pixel: true,
         time_invariant: true,
         cost: 0,
+        eval: None,
         wgsl: r#"
 fn noise_lattice(i: vec2<f32>, s: f32, ph: f32) -> f32 {
     return 0.5 + 0.5 * sin(6.2831853 * (pn_hash2(i, s) + ph));
@@ -287,6 +367,7 @@ fn color_adjust() -> NodeDef {
         per_pixel: true,
         time_invariant: true,
         cost: 0,
+        eval: None,
         wgsl: r#"
 fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> {
     let src = in_at(0u, px);
@@ -320,6 +401,7 @@ fn blend() -> NodeDef {
         per_pixel: true,
         time_invariant: true,
         cost: 0,
+        eval: None,
         wgsl: r#"
 fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> {
     let a = in_at(0u, px);
@@ -350,6 +432,7 @@ fn output() -> NodeDef {
         per_pixel: true,
         time_invariant: true,
         cost: 0,
+        eval: None,
         wgsl: "fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> { return in_at(0u, px); }",
     }
 }
@@ -364,7 +447,7 @@ mod tests {
         for d in reg {
             assert!(d.params.len() <= MAX_PARAMS, "{}", d.kind);
             assert!(d.inputs.len() <= MAX_INPUTS, "{}", d.kind);
-            assert!(d.wgsl.contains("fn node_fn"), "{}", d.kind);
+            assert!(d.is_value() || d.wgsl.contains("fn node_fn"), "{}", d.kind);
             for p in &d.params {
                 let ok = matches!(
                     (p.kind, &p.default),
@@ -377,7 +460,7 @@ mod tests {
                 assert!(ok, "{}.{} 預設值型別不符", d.kind, p.name);
             }
         }
-        assert!(reg.len() >= 24);
+        assert!(reg.len() >= 29);
         let mut kinds: Vec<_> = reg.iter().map(|d| d.kind).collect();
         kinds.sort_unstable();
         kinds.dedup();

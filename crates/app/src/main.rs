@@ -7,7 +7,7 @@ use eframe::egui;
 use egui_snarl::ui::{PinInfo, SnarlPin, SnarlStyle, SnarlViewer, SnarlWidget, get_selected_nodes};
 use egui_snarl::{InPin, InPinId, NodeId, OutPin, OutPinId, Snarl};
 use history::{Command, History};
-use pixelnode_graph::{Graph, Interp, Link, Node, Timeline, Track, Value};
+use pixelnode_graph::{DataType, Graph, Interp, Link, Node, Timeline, Track, Value};
 use pixelnode_nodes::{Category, NodeDef, ParamKind};
 use pixelnode_runtime::export::{ExportKind, ExportSpec};
 use pixelnode_runtime::worker::{EvalResult, Evaluator, Job, Message, Preview};
@@ -35,6 +35,16 @@ fn graph_id() -> egui::Id {
 }
 
 const SURFACE_COLOR: egui::Color32 = egui::Color32::from_rgb(0xb0, 0x7c, 0xe8);
+
+fn pin_color(ty: DataType) -> egui::Color32 {
+    match ty {
+        DataType::Surface => SURFACE_COLOR,
+        DataType::Float => egui::Color32::from_rgb(0x6c, 0xc6, 0x6c),
+        DataType::Int => egui::Color32::from_rgb(0x4c, 0xb8, 0xb8),
+        DataType::Color => egui::Color32::from_rgb(0xe8, 0xc0, 0x4c),
+        _ => egui::Color32::GRAY,
+    }
+}
 
 struct Viewer<'a> {
     defs: &'a HashMap<String, NodeDef>,
@@ -115,7 +125,7 @@ impl SnarlViewer<NodeData> for Viewer<'_> {
     }
 
     fn inputs(&mut self, node: &NodeData) -> usize {
-        self.def(node).inputs.len()
+        self.def(node).input_count()
     }
 
     fn outputs(&mut self, node: &NodeData) -> usize {
@@ -123,13 +133,22 @@ impl SnarlViewer<NodeData> for Viewer<'_> {
     }
 
     fn show_input(&mut self, pin: &InPin, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> impl SnarlPin + 'static {
-        ui.label(self.def(&snarl[pin.id.node]).inputs[pin.id.input].name);
-        PinInfo::circle().with_fill(SURFACE_COLOR)
+        let def = self.def(&snarl[pin.id.node]);
+        let (name, ty) = def.input_port(pin.id.input).unwrap_or(("?", DataType::Surface));
+        if pin.id.input < def.inputs.len() {
+            ui.label(name);
+            PinInfo::circle().with_fill(pin_color(ty))
+        } else {
+            // 參數 port：小字標籤，連線後該參數由上游數值驅動。
+            ui.label(egui::RichText::new(name).small().weak());
+            PinInfo::circle().with_fill(pin_color(ty))
+        }
     }
 
     fn show_output(&mut self, pin: &OutPin, ui: &mut egui::Ui, snarl: &mut Snarl<NodeData>) -> impl SnarlPin + 'static {
-        ui.label(self.def(&snarl[pin.id.node]).outputs[pin.id.output].name);
-        PinInfo::circle().with_fill(SURFACE_COLOR)
+        let port = self.def(&snarl[pin.id.node]).outputs[pin.id.output];
+        ui.label(port.name);
+        PinInfo::circle().with_fill(pin_color(port.ty))
     }
 
     fn has_body(&mut self, node: &NodeData) -> bool {
@@ -139,15 +158,31 @@ impl SnarlViewer<NodeData> for Viewer<'_> {
     fn show_body(
         &mut self,
         node: NodeId,
-        _inputs: &[InPin],
+        inputs: &[InPin],
         _outputs: &[OutPin],
         ui: &mut egui::Ui,
         snarl: &mut Snarl<NodeData>,
     ) {
         let def = self.defs[&snarl[node].kind].clone();
         ui.vertical(|ui| {
-            ui.set_max_width(200.0);
-            for p in &def.params {
+            ui.set_max_width(if def.params.iter().any(|p| matches!(p.kind, ParamKind::Text { multiline: true })) {
+                340.0
+            } else {
+                200.0
+            });
+            for (pi, p) in def.params.iter().enumerate() {
+                let linked = def
+                    .param_port_of(pi)
+                    .and_then(|port| inputs.get(port))
+                    .is_some_and(|pin| !pin.remotes.is_empty());
+                if linked {
+                    ui.horizontal(|ui| {
+                        ui.add_space(18.0);
+                        ui.label(p.label);
+                        ui.weak("← 已連線");
+                    });
+                    continue;
+                }
                 let frame = self.frame;
                 let track = snarl[node].anim.get(p.name).cloned();
                 let old = snarl[node].param_at(p.name, frame).unwrap_or_else(|| p.default.clone());
@@ -213,7 +248,7 @@ impl SnarlViewer<NodeData> for Viewer<'_> {
 
     fn connect(&mut self, from: &OutPin, to: &InPin, snarl: &mut Snarl<NodeData>) {
         let out_ty = self.def(&snarl[from.id.node]).outputs[from.id.output].ty;
-        let in_ty = self.def(&snarl[to.id.node]).inputs[to.id.input].ty;
+        let Some((_, in_ty)) = self.def(&snarl[to.id.node]).input_port(to.id.input) else { return };
         if !in_ty.accepts(out_ty) || from.id.node == to.id.node {
             return;
         }

@@ -8,11 +8,14 @@
 //! 參數一律走 storage buffer，WGSL 只依「子圖結構」生成，[`Kernel::shader_key`]
 //! 相同就共用已編譯的 pipeline，改參數不重編。
 
-use pixelnode_graph::{Graph, NodeId, Value};
+use pixelnode_graph::{Graph, NodeId};
 use pixelnode_nodes::{COMMON_WGSL, MAX_INPUTS, MAX_PARAMS, NodeDef};
+
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
+
+mod schedule;
 
 /// 單一 kernel 最多可讀取的輸入 texture 數。
 pub const MAX_KERNEL_TEXTURES: usize = 8;
@@ -234,104 +237,18 @@ pub fn compile_with(graph: &Graph, opts: CompileOptions) -> Result<Plan, Compile
         let from = def_of(l.from_node)?;
         let to = def_of(l.to_node)?;
         let out = from.outputs.get(l.from_port).ok_or(CompileError::BadPort { node: l.from_node, port: l.from_port })?;
-        let inp = to.inputs.get(l.to_port).ok_or(CompileError::BadPort { node: l.to_node, port: l.to_port })?;
-        if !inp.ty.accepts(out.ty) {
+        let (_, in_ty) = to.input_port(l.to_port).ok_or(CompileError::BadPort { node: l.to_node, port: l.to_port })?;
+        if !in_ty.accepts(out.ty) {
             return Err(CompileError::TypeMismatch { to: l.to_node, port: l.to_port });
         }
     }
 
     let out_id = graph.nodes.iter().find(|n| n.kind == "output").map(|n| n.id).ok_or(CompileError::NoOutput)?;
-    let steps = schedule(graph, &defs, out_id, opts.frame)?;
+    let mut sched = schedule::Scheduler::new(graph, &defs, opts.frame);
+    sched.visit(out_id)?;
+    let steps = sched.steps;
     let kernels = fuse(&steps, opts);
     Ok(Plan { canvas: graph.canvas, steps, kernels })
-}
-
-/// 從 Output 往回 DFS：只排程可達節點（pull-based），並偵測循環。
-fn schedule(
-    graph: &Graph,
-    defs: &HashMap<&'static str, &'static NodeDef>,
-    out_id: NodeId,
-    frame: u32,
-) -> Result<Vec<Step>, CompileError> {
-    #[derive(Clone, Copy)]
-    enum Mark {
-        Visiting,
-        Done(usize),
-    }
-    // 先建索引，避免每次查找線性掃描。
-    let nodes: HashMap<NodeId, &pixelnode_graph::Node> = graph.nodes.iter().map(|n| (n.id, n)).collect();
-    let sources: HashMap<(NodeId, usize), NodeId> =
-        graph.links.iter().map(|l| ((l.to_node, l.to_port), l.from_node)).collect();
-
-    type Ctx<'a> = (
-        &'a HashMap<NodeId, &'a pixelnode_graph::Node>,
-        &'a HashMap<(NodeId, usize), NodeId>,
-        &'a HashMap<&'static str, &'static NodeDef>,
-        [u32; 2],
-        u32,
-    );
-
-    fn visit(
-        id: NodeId,
-        cx: &Ctx<'_>,
-        marks: &mut HashMap<NodeId, Mark>,
-        steps: &mut Vec<Step>,
-    ) -> Result<usize, CompileError> {
-        match marks.get(&id) {
-            Some(Mark::Done(i)) => return Ok(*i),
-            Some(Mark::Visiting) => return Err(CompileError::Cycle(id)),
-            None => {}
-        }
-        marks.insert(id, Mark::Visiting);
-        let (nodes, sources, defs, canvas, frame) = cx;
-        let node = nodes.get(&id).ok_or(CompileError::NoOutput)?;
-        let def = *defs.get(node.kind.as_str()).ok_or_else(|| CompileError::UnknownKind(node.kind.clone()))?;
-
-        let mut inputs = [None; MAX_INPUTS];
-        for (port, slot) in inputs.iter_mut().enumerate().take(def.inputs.len()) {
-            if let Some(&src) = sources.get(&(id, port)) {
-                *slot = Some(visit(src, cx, marks, steps)?);
-            }
-        }
-        let animated = !def.time_invariant
-            || node.anim.values().any(|t| t.keys.len() > 1)
-            || inputs.iter().flatten().any(|&i| steps[i].animated);
-
-        let mut params = [[0.0f32; 4]; MAX_PARAMS];
-        let mut text = None;
-        for (slot, p) in params.iter_mut().zip(&def.params) {
-            let v = node.param_at(p.name, *frame).unwrap_or_else(|| p.default.clone());
-            if let (Value::Text(t), None) = (&v, &text) {
-                text = Some(t.clone());
-            }
-            *slot = v.to_vec4();
-        }
-
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        def.kind.hash(&mut h);
-        canvas.hash(&mut h);
-        // 與時間無關的節點不把影格納入 hash：參數值相同就跨影格共用快取。
-        if !def.time_invariant {
-            frame.hash(&mut h);
-        }
-        for v in params.iter().flatten() {
-            v.to_bits().hash(&mut h);
-        }
-        for i in inputs {
-            i.map(|i| steps[i].hash).hash(&mut h);
-        }
-        text.hash(&mut h);
-
-        steps.push(Step { node: id, def, inputs, params, hash: h.finish(), animated, text });
-        let idx = steps.len() - 1;
-        marks.insert(id, Mark::Done(idx));
-        Ok(idx)
-    }
-
-    let mut marks = HashMap::new();
-    let mut steps = Vec::new();
-    visit(out_id, &(&nodes, &sources, defs, graph.canvas, frame), &mut marks, &mut steps)?;
-    Ok(steps)
 }
 
 fn fuse(steps: &[Step], opts: CompileOptions) -> Vec<Kernel> {
@@ -572,6 +489,55 @@ mod tests {
         assert_ne!(a.output_kernel().hash, b.output_kernel().hash);
         assert_eq!(a.output_kernel().shader_key, b.output_kernel().shader_key);
         assert_eq!(b.kernels[0].params[7], [0.5, 0.0, 0.0, 0.0]); // noise 第 8 個參數 = phase
+    }
+
+    #[test]
+    fn value_nodes_drive_params() {
+        // time(循環) → wave → noise.phase
+        let mut g = chain();
+        g.nodes.push(node(10, "time"));
+        g.nodes.push(node(11, "wave"));
+        let noise_def = pixelnode_nodes::find("noise").unwrap();
+        let phase_port = noise_def.param_port_of(7).unwrap();
+        let wave_t = pixelnode_nodes::find("wave").unwrap().param_port_of(0).unwrap();
+        g.links.push(Link { from_node: NodeId(10), from_port: 0, to_node: NodeId(11), to_port: wave_t });
+        g.links.push(Link { from_node: NodeId(11), from_port: 0, to_node: NodeId(1), to_port: phase_port });
+        let at = |f| compile_with(&g, CompileOptions { frame: f, ..Default::default() }).unwrap();
+        let (a, b) = (at(0), at(6));
+        assert!(a.steps.iter().all(|s| !s.def.is_value()), "數值節點不產生 step");
+        assert_ne!(a.output_kernel().hash, b.output_kernel().hash);
+        assert!(a.steps[0].animated);
+        // timeline 預設 24 格：第 6 格 t = 0.25 → sin(π/2) → 0.5 + 0.5 = 1.0
+        assert!((b.steps[0].params[7][0] - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn value_into_surface_becomes_solid() {
+        let g = Graph {
+            nodes: vec![node(1, "make_color"), node(2, "output")],
+            links: vec![link(1, 2, 0)],
+            ..Default::default()
+        };
+        let plan = compile(&g).unwrap();
+        assert_eq!(plan.steps[0].def.kind, "solid");
+        assert_eq!(plan.steps[0].params[0], [1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn value_cycle_detected() {
+        let math = pixelnode_nodes::find("math").unwrap();
+        let a_port = math.param_port_of(1).unwrap();
+        let g = Graph {
+            nodes: vec![node(1, "math"), node(2, "math"), node(3, "solid"), node(4, "output")],
+            links: vec![
+                Link { from_node: NodeId(1), from_port: 0, to_node: NodeId(2), to_port: a_port },
+                Link { from_node: NodeId(2), from_port: 0, to_node: NodeId(1), to_port: a_port },
+                Link { from_node: NodeId(2), from_port: 0, to_node: NodeId(3), to_port: 0 },
+                link(3, 4, 0),
+            ],
+            ..Default::default()
+        };
+        assert!(matches!(compile(&g), Err(CompileError::Cycle(_))));
     }
 
     #[test]
