@@ -63,10 +63,6 @@ fn pn_hash2(p: vec2<f32>, seed: f32) -> f32 {
     q = q + dot(q, q.yzx + 33.33);
     return fract((q.x + q.y) * q.z);
 }
-fn pn_grad2(p: vec2<f32>, seed: f32) -> vec2<f32> {
-    let a = pn_hash2(p, seed) * 6.2831853;
-    return vec2<f32>(cos(a), sin(a));
-}
 fn pn_rgb2hsv(c: vec3<f32>) -> vec3<f32> {
     let k = vec4<f32>(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
     let p = mix(vec4<f32>(c.bg, k.wz), vec4<f32>(c.gb, k.xy), step(c.b, c.g));
@@ -129,33 +125,45 @@ fn noise() -> NodeDef {
             ParamDef { name: "seed", label: "種子", kind: ParamKind::Int { min: 0, max: 9999 }, default: Value::Int(0) },
             ParamDef { name: "octaves", label: "八度", kind: ParamKind::Int { min: 1, max: 8 }, default: Value::Int(3) },
             f("contrast", "對比", 0.1, 4.0, 1.0),
+            f("offset_x", "位移 X", -64.0, 64.0, 0.0),
+            f("offset_y", "位移 Y", -64.0, 64.0, 0.0),
+            // 相位 0→1 可無縫循環（梯度 / 特徵點繞圈）。
+            f("phase", "相位", 0.0, 1.0, 0.0),
         ],
         per_pixel: true,
         time_invariant: true,
         wgsl: r#"
-fn noise_value(p: vec2<f32>, s: f32) -> f32 {
+fn noise_lattice(i: vec2<f32>, s: f32, ph: f32) -> f32 {
+    return 0.5 + 0.5 * sin(6.2831853 * (pn_hash2(i, s) + ph));
+}
+fn noise_value(p: vec2<f32>, s: f32, ph: f32) -> f32 {
     let i = floor(p); let f = fract(p);
     let u = f * f * (3.0 - 2.0 * f);
-    let a = pn_hash2(i, s); let b = pn_hash2(i + vec2<f32>(1.0, 0.0), s);
-    let c = pn_hash2(i + vec2<f32>(0.0, 1.0), s); let d = pn_hash2(i + vec2<f32>(1.0, 1.0), s);
+    let a = noise_lattice(i, s, ph); let b = noise_lattice(i + vec2<f32>(1.0, 0.0), s, ph);
+    let c = noise_lattice(i + vec2<f32>(0.0, 1.0), s, ph); let d = noise_lattice(i + vec2<f32>(1.0, 1.0), s, ph);
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
-fn noise_perlin(p: vec2<f32>, s: f32) -> f32 {
+fn noise_grad(i: vec2<f32>, s: f32, ph: f32) -> vec2<f32> {
+    let a = (pn_hash2(i, s) + ph) * 6.2831853;
+    return vec2<f32>(cos(a), sin(a));
+}
+fn noise_perlin(p: vec2<f32>, s: f32, ph: f32) -> f32 {
     let i = floor(p); let f = fract(p);
     let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
-    let a = dot(pn_grad2(i, s), f);
-    let b = dot(pn_grad2(i + vec2<f32>(1.0, 0.0), s), f - vec2<f32>(1.0, 0.0));
-    let c = dot(pn_grad2(i + vec2<f32>(0.0, 1.0), s), f - vec2<f32>(0.0, 1.0));
-    let d = dot(pn_grad2(i + vec2<f32>(1.0, 1.0), s), f - vec2<f32>(1.0, 1.0));
+    let a = dot(noise_grad(i, s, ph), f);
+    let b = dot(noise_grad(i + vec2<f32>(1.0, 0.0), s, ph), f - vec2<f32>(1.0, 0.0));
+    let c = dot(noise_grad(i + vec2<f32>(0.0, 1.0), s, ph), f - vec2<f32>(0.0, 1.0));
+    let d = dot(noise_grad(i + vec2<f32>(1.0, 1.0), s, ph), f - vec2<f32>(1.0, 1.0));
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y) * 0.7071 + 0.5;
 }
-fn noise_cellular(p: vec2<f32>, s: f32) -> f32 {
+fn noise_cellular(p: vec2<f32>, s: f32, ph: f32) -> f32 {
     let i = floor(p); let f = fract(p);
     var md = 8.0;
     for (var y = -1; y <= 1; y++) {
         for (var x = -1; x <= 1; x++) {
             let o = vec2<f32>(f32(x), f32(y));
-            let pt = vec2<f32>(pn_hash2(i + o, s), pn_hash2(i + o, s + 71.0));
+            let a = 6.2831853 * (pn_hash2(i + o, s + 71.0) + ph);
+            let pt = vec2<f32>(0.5) + 0.4 * vec2<f32>(cos(a), sin(a)) * pn_hash2(i + o, s);
             md = min(md, length(o + pt - f));
         }
     }
@@ -165,13 +173,14 @@ fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> {
     let kind = i32(P[0].x);
     let seed = P[2].x;
     let oct = i32(P[3].x);
-    var p = uv * P[1].x;
+    let ph = P[7].x;
+    var p = uv * P[1].x + vec2<f32>(P[5].x, P[6].x);
     var amp = 0.5; var sum = 0.0; var norm = 0.0;
     for (var o = 0; o < oct; o++) {
         var n: f32;
-        if (kind == 0) { n = noise_value(p, seed); }
-        else if (kind == 1) { n = noise_perlin(p, seed); }
-        else { n = noise_cellular(p, seed); }
+        if (kind == 0) { n = noise_value(p, seed, ph); }
+        else if (kind == 1) { n = noise_perlin(p, seed, ph); }
+        else { n = noise_cellular(p, seed, ph); }
         sum += n * amp; norm += amp; amp *= 0.5; p = p * 2.0 + vec2<f32>(17.3, 9.1);
     }
     let v = clamp((sum / norm - 0.5) * P[4].x + 0.5, 0.0, 1.0);

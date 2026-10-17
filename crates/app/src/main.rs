@@ -1,25 +1,32 @@
-//! PixelNode 編輯器：節點畫布 + 即時預覽。
+//! PixelNode 編輯器：節點畫布 + 即時預覽 + 時間軸。
 
 mod history;
+mod timeline;
 
 use eframe::egui;
 use egui_snarl::ui::{PinInfo, SnarlPin, SnarlStyle, SnarlViewer, SnarlWidget, get_selected_nodes};
 use egui_snarl::{InPin, InPinId, NodeId, OutPin, OutPinId, Snarl};
 use history::{Command, History};
-use pixelnode_graph::{Graph, Link, Node, Value};
+use pixelnode_graph::{Graph, Interp, Link, Node, Timeline, Track, Value};
 use pixelnode_nodes::{NodeDef, ParamKind};
-use pixelnode_runtime::worker::{EvalResult, Evaluator, Preview};
+use pixelnode_runtime::export::{ExportKind, ExportSpec};
+use pixelnode_runtime::worker::{EvalResult, Evaluator, Job, Message, Preview};
 use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodeData {
     pub kind: String,
     pub params: BTreeMap<String, Value>,
+    pub anim: BTreeMap<String, Track>,
 }
 
 impl NodeData {
     pub fn new(def: &NodeDef) -> Self {
-        Self { kind: def.kind.to_string(), params: def.default_params() }
+        Self { kind: def.kind.to_string(), params: def.default_params(), anim: BTreeMap::new() }
+    }
+
+    pub fn param_at(&self, name: &str, frame: u32) -> Option<Value> {
+        self.anim.get(name).and_then(|t| t.sample(frame)).or_else(|| self.params.get(name).cloned())
     }
 }
 
@@ -32,11 +39,73 @@ const SURFACE_COLOR: egui::Color32 = egui::Color32::from_rgb(0xb0, 0x7c, 0xe8);
 struct Viewer<'a> {
     defs: &'a HashMap<String, NodeDef>,
     history: &'a mut History,
+    frame: u32,
 }
+
+const KEY_ON: egui::Color32 = egui::Color32::from_rgb(0xf5, 0xc5, 0x42);
+const KEY_TRACK: egui::Color32 = egui::Color32::from_rgb(0xc0, 0x80, 0x30);
 
 impl Viewer<'_> {
     fn def(&self, node: &NodeData) -> &NodeDef {
         &self.defs[&node.kind]
+    }
+}
+
+impl Viewer<'_> {
+    /// ◆ 目前影格有 key；◇（橘）有軌道但此格無 key；◇（灰）未動畫。
+    /// 左鍵切換 key，右鍵設定此 key 的插值方式。
+    fn key_button(
+        &mut self,
+        ui: &mut egui::Ui,
+        snarl: &mut Snarl<NodeData>,
+        node: NodeId,
+        name: &str,
+        track: Option<&Track>,
+        current: &Value,
+    ) {
+        let frame = self.frame;
+        let key = track.and_then(|t| t.key_at(frame));
+        let (glyph, color) = match (track, key) {
+            (_, Some(_)) => ("◆", KEY_ON),
+            (Some(_), None) => ("◇", KEY_TRACK),
+            (None, _) => ("◇", ui.visuals().weak_text_color()),
+        };
+        let resp = ui
+            .add(egui::Button::new(egui::RichText::new(glyph).color(color)).frame(false))
+            .on_hover_text("左鍵：新增 / 移除 keyframe　右鍵：插值方式");
+        let mut new_track = None;
+        if resp.clicked() {
+            let mut t = track.cloned().unwrap_or_default();
+            if key.is_some() {
+                t.remove_key(frame);
+            } else {
+                t.set_key(frame, current.clone());
+            }
+            new_track = Some(if t.is_empty() { None } else { Some(t) });
+        }
+        if let (Some(t), Some(k)) = (track, key) {
+            resp.context_menu(|ui| {
+                for interp in Interp::ALL {
+                    if ui.selectable_label(k.interp == interp, interp.label()).clicked() {
+                        let mut t = t.clone();
+                        if let Some(k) = t.keys.iter_mut().find(|k| k.frame == frame) {
+                            k.interp = interp;
+                        }
+                        new_track = Some(Some(t));
+                        ui.close();
+                    }
+                }
+            });
+        }
+        if let Some(new) = new_track {
+            match &new {
+                Some(t) => snarl[node].anim.insert(name.to_string(), t.clone()),
+                None => snarl[node].anim.remove(name),
+            };
+            self.history.seal();
+            self.history.record(Command::SetTrack { node, name: name.to_string(), old: track.cloned(), new });
+            self.history.seal();
+        }
     }
 }
 
@@ -79,9 +148,12 @@ impl SnarlViewer<NodeData> for Viewer<'_> {
         ui.vertical(|ui| {
             ui.set_max_width(200.0);
             for p in &def.params {
-                let old = snarl[node].params.get(p.name).cloned().unwrap_or_else(|| p.default.clone());
+                let frame = self.frame;
+                let track = snarl[node].anim.get(p.name).cloned();
+                let old = snarl[node].param_at(p.name, frame).unwrap_or_else(|| p.default.clone());
                 let mut v = old.clone();
                 ui.horizontal(|ui| {
+                    self.key_button(ui, snarl, node, p.name, track.as_ref(), &old);
                     ui.label(p.label);
                     match (&mut v, p.kind) {
                         (Value::Float(x), ParamKind::Float { min, max }) => {
@@ -108,8 +180,24 @@ impl SnarlViewer<NodeData> for Viewer<'_> {
                     }
                 });
                 if v != old {
-                    snarl[node].params.insert(p.name.to_string(), v.clone());
-                    self.history.record(Command::SetParam { node, name: p.name.to_string(), old, new: v });
+                    match track {
+                        // 有軌道：編輯即在目前影格設 key。
+                        Some(t) => {
+                            let mut new = t.clone();
+                            new.set_key(frame, v);
+                            snarl[node].anim.insert(p.name.to_string(), new.clone());
+                            self.history.record(Command::SetTrack {
+                                node,
+                                name: p.name.to_string(),
+                                old: Some(t),
+                                new: Some(new),
+                            });
+                        }
+                        None => {
+                            snarl[node].params.insert(p.name.to_string(), v.clone());
+                            self.history.record(Command::SetParam { node, name: p.name.to_string(), old, new: v });
+                        }
+                    }
                 }
             }
         });
@@ -193,7 +281,7 @@ fn remove_node(snarl: &mut Snarl<NodeData>, history: &mut History, node: NodeId)
     history.record(Command::Batch(batch));
 }
 
-fn snarl_to_graph(snarl: &Snarl<NodeData>, canvas: [u32; 2]) -> Graph {
+fn snarl_to_graph(snarl: &Snarl<NodeData>, canvas: [u32; 2], timeline: Timeline) -> Graph {
     let nodes = snarl
         .nodes_pos_ids()
         .map(|(id, pos, d)| Node {
@@ -201,6 +289,7 @@ fn snarl_to_graph(snarl: &Snarl<NodeData>, canvas: [u32; 2]) -> Graph {
             kind: d.kind.clone(),
             params: d.params.clone(),
             pos: [pos.x, pos.y],
+            anim: d.anim.clone(),
         })
         .collect();
     let mut links: Vec<Link> = snarl
@@ -213,14 +302,14 @@ fn snarl_to_graph(snarl: &Snarl<NodeData>, canvas: [u32; 2]) -> Graph {
         })
         .collect();
     links.sort_by_key(|l| (l.to_node, l.to_port, l.from_node, l.from_port));
-    Graph { canvas, nodes, links, ..Default::default() }
+    Graph { canvas, nodes, links, timeline, ..Default::default() }
 }
 
 fn graph_to_snarl(graph: &Graph) -> Snarl<NodeData> {
     let mut snarl = Snarl::new();
     let mut ids = HashMap::new();
     for n in &graph.nodes {
-        let id = snarl.insert_node(egui::pos2(n.pos[0], n.pos[1]), NodeData { kind: n.kind.clone(), params: n.params.clone() });
+        let id = snarl.insert_node(egui::pos2(n.pos[0], n.pos[1]), NodeData { kind: n.kind.clone(), params: n.params.clone(), anim: n.anim.clone() });
         ids.insert(n.id, id);
     }
     for l in &graph.links {
@@ -234,7 +323,13 @@ fn graph_to_snarl(graph: &Graph) -> Snarl<NodeData> {
 fn default_snarl() -> Snarl<NodeData> {
     let mut s = Snarl::new();
     let d = |k| NodeData::new(pixelnode_nodes::find(k).unwrap());
-    let noise = s.insert_node(egui::pos2(0.0, 0.0), d("noise"));
+    // 示範：相位 0→1 跨整段時間軸，循環播放無接縫。
+    let mut noise = d("noise");
+    let mut phase = Track::default();
+    phase.set_key(0, Value::Float(0.0));
+    phase.set_key(Timeline::default().frames, Value::Float(1.0));
+    noise.anim.insert("phase".into(), phase);
+    let noise = s.insert_node(egui::pos2(0.0, 0.0), noise);
     let mut adj = d("color_adjust");
     adj.params.insert("tint".into(), Value::Color([1.0, 0.6, 0.3, 1.0]));
     let adj = s.insert_node(egui::pos2(320.0, 0.0), adj);
@@ -268,12 +363,19 @@ struct App {
     canvas: [u32; 2],
     evaluator: Evaluator,
     /// 上次送出的求值 snapshot（不含節點位置），用於避免重複送出。
-    submitted: Option<Graph>,
+    submitted: Option<(Graph, u32)>,
     last: Option<EvalResult>,
     preview: Option<PreviewTex>,
     render_state: Option<eframe::egui_wgpu::RenderState>,
     path: String,
     status: String,
+    timeline: Timeline,
+    frame: u32,
+    playing: bool,
+    play_clock: f64,
+    export_dir: String,
+    export_scale: u32,
+    exporting: bool,
 }
 
 impl App {
@@ -297,11 +399,18 @@ impl App {
             preview: None,
             path: "graph.pixelnode.json".into(),
             status: String::new(),
+            timeline: Timeline::default(),
+            frame: 0,
+            playing: false,
+            play_clock: 0.0,
+            export_dir: "export".into(),
+            export_scale: 4,
+            exporting: false,
         }
     }
 
     fn save(&mut self) {
-        let json = snarl_to_graph(&self.snarl, self.canvas).to_json();
+        let json = self.graph().to_json();
         self.status = match std::fs::write(&self.path, json) {
             Ok(()) => format!("已儲存 {}", self.path),
             Err(e) => format!("儲存失敗：{e}"),
@@ -316,6 +425,8 @@ impl App {
             Ok(g) => {
                 self.snarl = graph_to_snarl(&g);
                 self.canvas = g.canvas;
+                self.timeline = g.timeline;
+                self.frame = 0;
                 self.history.clear();
                 self.status = format!("已載入 {}", self.path);
             }
@@ -326,6 +437,19 @@ impl App {
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         if ctx.text_edit_focused() {
             return;
+        }
+        let (space, left, right) = ctx.input(|i| {
+            (i.key_pressed(egui::Key::Space), i.key_pressed(egui::Key::ArrowLeft), i.key_pressed(egui::Key::ArrowRight))
+        });
+        if space {
+            self.playing = !self.playing;
+        }
+        let n = self.timeline.frames.max(1);
+        if left {
+            self.frame = (self.frame + n - 1) % n;
+        }
+        if right {
+            self.frame = (self.frame + 1) % n;
         }
         let (undo, redo, delete) = ctx.input_mut(|i| {
             let redo = i.consume_shortcut(&egui::KeyboardShortcut::new(
@@ -350,17 +474,45 @@ impl App {
         }
     }
 
+    fn graph(&self) -> Graph {
+        snarl_to_graph(&self.snarl, self.canvas, self.timeline)
+    }
+
     fn submit_if_changed(&mut self) {
-        let mut g = snarl_to_graph(&self.snarl, self.canvas);
+        let mut g = self.graph();
         g.nodes.iter_mut().for_each(|n| n.pos = [0.0; 2]);
-        if self.submitted.as_ref() != Some(&g) {
-            self.evaluator.submit(g.clone());
-            self.submitted = Some(g);
+        if self.submitted.as_ref().is_none_or(|(sg, sf)| *sg != g || *sf != self.frame) {
+            self.evaluator.submit(Job::Eval { graph: g.clone(), frame: self.frame });
+            self.submitted = Some((g, self.frame));
         }
     }
 
+    fn export(&mut self, kind: ExportKind) {
+        let dir = std::path::PathBuf::from(&self.export_dir);
+        let path = match kind {
+            ExportKind::Gif => dir.join("anim.gif"),
+            ExportKind::PngSequence => dir.join("frames"),
+            ExportKind::SpriteSheet { .. } => dir.join("sheet.png"),
+        };
+        self.exporting = true;
+        self.status = "匯出中…".into();
+        let spec = ExportSpec { kind, path, scale: self.export_scale };
+        self.evaluator.submit(Job::Export { graph: self.graph(), spec });
+    }
+
     fn receive(&mut self, ctx: &egui::Context) {
-        for res in self.evaluator.poll() {
+        for msg in self.evaluator.poll() {
+            let res = match msg {
+                Message::Eval(res) => res,
+                Message::Export(r) => {
+                    self.exporting = false;
+                    self.status = match r {
+                        Ok(s) => format!("已匯出：{s}"),
+                        Err(e) => format!("匯出失敗：{e}"),
+                    };
+                    continue;
+                }
+            };
             match &res.preview {
                 Ok(Preview::Gpu { texture, fresh }) => {
                     let size = egui::vec2(texture.width() as f32, texture.height() as f32);
@@ -458,15 +610,27 @@ impl eframe::App for App {
                     self.history.redo(&mut self.snarl);
                 }
                 ui.separator();
-                ui.weak("右鍵畫布新增節點 · Del 刪除 · Ctrl+Z / Ctrl+Y");
+                ui.weak("右鍵新增節點 · Del 刪除 · Ctrl+Z/Y · 空白鍵播放 · ←→ 逐格");
                 ui.label(&self.status);
             });
         });
 
+        if self.playing {
+            let dt = ctx.input(|i| i.stable_dt) as f64;
+            self.play_clock += dt;
+            let step = 1.0 / self.timeline.fps.max(1) as f64;
+            while self.play_clock >= step {
+                self.play_clock -= step;
+                self.frame = (self.frame + 1) % self.timeline.frames.max(1);
+            }
+            ctx.request_repaint();
+        }
+
+        egui::Panel::bottom("timeline").show(ui, |ui| self.timeline_panel(ui));
         egui::Panel::right("preview").default_size(360.0).show(ui, |ui| self.preview_panel(ui));
 
         egui::CentralPanel::default().show(ui, |ui| {
-            let mut viewer = Viewer { defs: &self.defs, history: &mut self.history };
+            let mut viewer = Viewer { defs: &self.defs, history: &mut self.history, frame: self.frame };
             SnarlWidget::new().id(graph_id()).style(self.style).show(&mut self.snarl, &mut viewer, ui);
         });
 
@@ -505,9 +669,12 @@ mod tests {
     #[test]
     fn snarl_graph_roundtrip() {
         let s = default_snarl();
-        let g = snarl_to_graph(&s, [64, 32]);
-        let g2 = snarl_to_graph(&graph_to_snarl(&Graph::from_json(&g.to_json()).unwrap()), [64, 32]);
-        assert_eq!(g, g2);
+        let tl = Timeline { frames: 8, fps: 10 };
+        let g = snarl_to_graph(&s, [64, 32], tl);
+        let g2 = Graph::from_json(&g.to_json()).unwrap();
+        assert_eq!(g2.timeline, tl);
+        assert_eq!(g, snarl_to_graph(&graph_to_snarl(&g2), [64, 32], tl));
+        assert!(g.nodes.iter().any(|n| n.anim.contains_key("phase")));
         assert!(pixelnode_compiler::compile(&g).is_ok());
     }
 }

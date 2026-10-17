@@ -3,8 +3,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+mod anim;
+pub use anim::{Interp, Key, Timeline, Track};
+
 /// 存檔格式版本；格式變動時遞增並在 [`Graph::from_json`] 中做 migration。
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataType {
@@ -75,6 +78,16 @@ pub struct Node {
     pub params: BTreeMap<String, Value>,
     #[serde(default)]
     pub pos: [f32; 2],
+    /// 參數名 → keyframe 軌道。有軌道的參數以軌道取樣值為準。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub anim: BTreeMap<String, Track>,
+}
+
+impl Node {
+    /// 某參數在指定影格的值（軌道優先，其次靜態值）。
+    pub fn param_at(&self, name: &str, frame: u32) -> Option<Value> {
+        self.anim.get(name).and_then(|t| t.sample(frame)).or_else(|| self.params.get(name).cloned())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -91,11 +104,20 @@ pub struct Graph {
     pub canvas: [u32; 2],
     pub nodes: Vec<Node>,
     pub links: Vec<Link>,
+    /// v2 新增；v1 檔案讀入時使用預設值。
+    #[serde(default)]
+    pub timeline: Timeline,
 }
 
 impl Default for Graph {
     fn default() -> Self {
-        Self { version: FORMAT_VERSION, canvas: [128, 128], nodes: Vec::new(), links: Vec::new() }
+        Self {
+            version: FORMAT_VERSION,
+            canvas: [128, 128],
+            nodes: Vec::new(),
+            links: Vec::new(),
+            timeline: Timeline::default(),
+        }
     }
 }
 
@@ -139,7 +161,7 @@ impl Graph {
         if version > FORMAT_VERSION || version == 0 {
             return Err(LoadError::UnsupportedVersion(version));
         }
-        // 未來版本的 migration 在此逐步升級 `raw`。
+        // migration：v1 → v2 只新增了有預設值的欄位（timeline、node.anim），serde default 即可。
         let mut g: Graph = serde_json::from_value(raw).map_err(LoadError::Json)?;
         g.version = FORMAT_VERSION;
         Ok(g)
@@ -150,14 +172,21 @@ impl Graph {
 mod tests {
     use super::*;
 
+    fn anim() -> BTreeMap<String, Track> {
+        let mut t = Track::default();
+        t.set_key(0, Value::Float(1.0));
+        t.set_key(8, Value::Float(9.0));
+        BTreeMap::from([("scale".to_string(), t)])
+    }
+
     fn sample() -> Graph {
         let mut params = BTreeMap::new();
         params.insert("scale".into(), Value::Float(4.0));
         params.insert("color".into(), Value::Color([1.0, 0.5, 0.0, 1.0]));
         Graph {
             nodes: vec![
-                Node { id: NodeId(1), kind: "noise".into(), params, pos: [0.0, 0.0] },
-                Node { id: NodeId(2), kind: "output".into(), params: BTreeMap::new(), pos: [200.0, 0.0] },
+                Node { id: NodeId(1), kind: "noise".into(), params, pos: [0.0, 0.0], anim: anim() },
+                Node { id: NodeId(2), kind: "output".into(), params: BTreeMap::new(), pos: [200.0, 0.0], anim: BTreeMap::new() },
             ],
             links: vec![Link { from_node: NodeId(1), from_port: 0, to_node: NodeId(2), to_port: 0 }],
             ..Default::default()
@@ -168,6 +197,22 @@ mod tests {
     fn json_roundtrip() {
         let g = sample();
         assert_eq!(Graph::from_json(&g.to_json()).unwrap(), g);
+    }
+
+    #[test]
+    fn loads_v1_file() {
+        let v1 = r#"{"version":1,"canvas":[64,64],"nodes":[{"id":1,"kind":"solid","params":{}}],"links":[]}"#;
+        let g = Graph::from_json(v1).unwrap();
+        assert_eq!(g.version, FORMAT_VERSION);
+        assert_eq!(g.timeline, Timeline::default());
+        assert!(g.nodes[0].anim.is_empty());
+    }
+
+    #[test]
+    fn param_at_prefers_track() {
+        let g = sample();
+        assert_eq!(g.nodes[0].param_at("scale", 4), Some(Value::Float(5.0)));
+        assert_eq!(g.nodes[0].param_at("color", 4), Some(Value::Color([1.0, 0.5, 0.0, 1.0])));
     }
 
     #[test]

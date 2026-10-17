@@ -4,7 +4,7 @@
 //! 設 `PIXELNODE_BENCH_CHECK=1` 時，融合未勝過未融合即以非零結束（CI 用）。
 //! 結果另寫入 `target/bench-pipeline.json`。
 
-use pixelnode_bench::{random_graph, tweak};
+use pixelnode_bench::{animate_one, random_graph, tweak};
 use pixelnode_compiler::{CompileOptions, compile_with};
 use pixelnode_runtime::Runtime;
 use std::time::{Duration, Instant};
@@ -32,8 +32,8 @@ fn main() {
         }
     };
     let graph = random_graph(NODES, CANVAS, 42);
-    let fused_opts = CompileOptions { fuse: true };
-    let unfused_opts = CompileOptions { fuse: false };
+    let fused_opts = CompileOptions { fuse: true, ..Default::default() };
+    let unfused_opts = CompileOptions { fuse: false, ..Default::default() };
     let mut rows = Vec::new();
 
     // 編譯（圖 → 計畫 + 全部 kernel 的 WGSL）
@@ -73,6 +73,22 @@ fn main() {
         dispatched += rt.stats.dispatched;
     }
     rows.push(Row { name: "cached fused ×60", total: t.elapsed(), note: format!("{dispatched} dispatches") });
+
+    // 動畫：只有一個 noise 的 phase 有 keyframe；其餘分支與時間無關，
+    // 第一輪後每格只重算受影響的 kernel；第二輪整段命中影格快取。
+    let mut g = graph.clone();
+    animate_one(&mut g, FRAMES);
+    rt.clear_cache();
+    for name in ["animated 1 track, 1st loop ×60", "animated 1 track, 2nd loop ×60"] {
+        let t = Instant::now();
+        let mut dispatched = 0;
+        for f in 0..FRAMES {
+            let plan = compile_with(&g, CompileOptions { frame: f, ..fused_opts }).unwrap();
+            rt.run(&plan, f);
+            dispatched += rt.stats.dispatched;
+        }
+        rows.push(Row { name, total: t.elapsed(), note: format!("{dispatched} dispatches") });
+    }
 
     // 拖 slider：每格改一個上游參數，含重新編譯計畫與讀回預覽。
     let mut g = graph.clone();

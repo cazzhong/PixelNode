@@ -3,7 +3,7 @@
 use crate::NodeData;
 use eframe::egui;
 use egui_snarl::{InPinId, NodeId, OutPinId, Snarl};
-use pixelnode_graph::Value;
+use pixelnode_graph::{Track, Value};
 
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -12,6 +12,8 @@ pub enum Command {
     Connect(OutPinId, InPinId),
     Disconnect(OutPinId, InPinId),
     SetParam { node: NodeId, name: String, old: Value, new: Value },
+    /// keyframe 軌道整條替換（None = 沒有軌道）。
+    SetTrack { node: NodeId, name: String, old: Option<Track>, new: Option<Track> },
     Batch(Vec<Command>),
 }
 
@@ -23,6 +25,7 @@ impl Command {
             Command::Connect(o, i) => Command::Disconnect(o, i),
             Command::Disconnect(o, i) => Command::Connect(o, i),
             Command::SetParam { node, name, old, new } => Command::SetParam { node, name, old: new, new: old },
+            Command::SetTrack { node, name, old, new } => Command::SetTrack { node, name, old: new, new: old },
             Command::Batch(v) => Command::Batch(v.iter().rev().map(Command::inverse).collect()),
         }
     }
@@ -57,6 +60,14 @@ impl Command {
                     n.params.insert(name.clone(), new.clone());
                 }
             }
+            Command::SetTrack { node, name, new, .. } => {
+                if let Some(n) = snarl.get_node_mut(map(*node, remaps)) {
+                    match new {
+                        Some(t) => n.anim.insert(name.clone(), t.clone()),
+                        None => n.anim.remove(name),
+                    };
+                }
+            }
             Command::Batch(v) => v.iter().for_each(|c| c.apply(snarl, remaps)),
         }
     }
@@ -73,7 +84,7 @@ impl Command {
                 f(&mut o.node);
                 f(&mut i.node);
             }
-            Command::SetParam { node, .. } => f(node),
+            Command::SetParam { node, .. } | Command::SetTrack { node, .. } => f(node),
             Command::Batch(v) => v.iter_mut().for_each(|c| c.remap(from, to)),
         }
     }
@@ -99,12 +110,22 @@ impl History {
             *last = new.clone();
             return;
         }
+        if let (
+            Some(Command::SetTrack { node: n0, name: a, new: last, .. }),
+            Command::SetTrack { node: n1, name: b, new, .. },
+        ) = (self.undo.last_mut(), &cmd)
+            && n0 == n1
+            && a == b
+        {
+            *last = new.clone();
+            return;
+        }
         self.undo.push(cmd);
     }
 
     /// 結束參數合併（例如開始編輯另一個東西時）。
     pub fn seal(&mut self) {
-        if matches!(self.undo.last(), Some(Command::SetParam { .. })) {
+        if matches!(self.undo.last(), Some(Command::SetParam { .. } | Command::SetTrack { .. })) {
             self.undo.push(Command::Batch(vec![]));
         }
     }

@@ -10,3 +10,5 @@ pixelnode-compiler.workspace = true
 wgpu.workspace = true
 pollster.workspace = true
 bytemuck.workspace = true
+png = "0.18.1"
+gif = "0.14.2"

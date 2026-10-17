@@ -1,6 +1,6 @@
 //! Benchmark 用的可重現測試圖產生器。
 
-use pixelnode_graph::{Graph, Link, Node, NodeId, Value};
+use pixelnode_graph::{Graph, Link, Node, NodeId, Track, Value};
 
 struct Lcg(u64);
 
@@ -29,7 +29,7 @@ pub fn random_graph(target: usize, canvas: [u32; 2], seed: u64) -> Graph {
     let mut add = |g: &mut Graph, kind: &str, rng: &mut Lcg| {
         let id = NodeId(next_id);
         next_id += 1;
-        let mut node = Node { id, kind: kind.into(), params: Default::default(), pos: [0.0; 2] };
+        let mut node = Node { id, kind: kind.into(), params: Default::default(), pos: [0.0; 2], anim: Default::default() };
         match kind {
             "noise" => {
                 node.params.insert("type".into(), Value::Enum(rng.below(3) as u32));
@@ -100,6 +100,16 @@ pub fn random_graph(target: usize, canvas: [u32; 2], seed: u64) -> Graph {
     let out = add(&mut g, "output", &mut rng);
     connect(&mut g, frontier[0], out, 0);
     g
+}
+
+/// 讓最後一個 noise 的 phase 在 `frames` 格內 0→1 循環。
+pub fn animate_one(g: &mut Graph, frames: u32) {
+    if let Some(n) = g.nodes.iter_mut().rev().find(|n| n.kind == "noise") {
+        let mut t = Track::default();
+        t.set_key(0, Value::Float(0.0));
+        t.set_key(frames, Value::Float(1.0));
+        n.anim.insert("phase".into(), t);
+    }
 }
 
 /// 調整某個 noise 節點的參數，模擬拖 slider。

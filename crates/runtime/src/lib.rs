@@ -2,7 +2,8 @@
 //!
 //! - pipeline 以子圖結構 hash 快取，改參數不重編。
 //! - 參數集中寫入單一 storage buffer，各 kernel 以對齊後的 offset 綁定。
-//! - kernel 輸出依內容 hash 快取；不再需要的 texture 回收到依尺寸分桶的 pool。
+//! - kernel 輸出依內容 hash 存進 LRU 快取（有記憶體上限），跨影格共用：
+//!   與時間無關的分支整段動畫只算一次。被淘汰的 texture 回收到依尺寸分桶的 pool。
 
 use pixelnode_compiler::{MAX_KERNEL_TEXTURES, Plan};
 use std::collections::HashMap;
@@ -12,6 +13,15 @@ pub mod worker;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// texture pool 閒置上限（位元組），超過就直接釋放。
 const POOL_BUDGET: u64 = 256 << 20;
+/// 輸出快取預設上限（位元組）。
+pub const DEFAULT_CACHE_BUDGET: u64 = 512 << 20;
+
+pub mod export;
+
+struct CacheEntry {
+    tex: wgpu::Texture,
+    last_used: u64,
+}
 
 #[derive(Debug, Clone)]
 pub struct Image {
@@ -73,8 +83,11 @@ pub struct Runtime {
     param_align: u64,
     readback: Option<wgpu::Buffer>,
     pool: TexturePool,
-    /// kernel 內容 hash → 輸出（只保留上一次計畫用到的）。
-    cache: HashMap<u64, wgpu::Texture>,
+    /// kernel 內容 hash → 輸出，LRU。
+    cache: HashMap<u64, CacheEntry>,
+    cache_bytes: u64,
+    pub cache_budget: u64,
+    tick: u64,
     pub stats: Stats,
     pub adapter_name: String,
     /// 預覽用 texture：只由 copy 寫入，不進 pool，UI 可安全持有。
@@ -182,6 +195,9 @@ impl Runtime {
             readback: None,
             pool: TexturePool::default(),
             cache: HashMap::new(),
+            cache_bytes: 0,
+            cache_budget: DEFAULT_CACHE_BUDGET,
+            tick: 0,
             stats: Stats::default(),
             display: None,
         }
@@ -189,9 +205,10 @@ impl Runtime {
 
     /// 清空輸出快取（benchmark 冷啟動用；pipeline 快取保留）。
     pub fn clear_cache(&mut self) {
-        for (_, t) in self.cache.drain() {
-            self.pool.release(t);
+        for (_, e) in self.cache.drain() {
+            self.pool.release(e.tex);
         }
+        self.cache_bytes = 0;
     }
 
     /// 執行並把 Output 讀回 CPU。
@@ -264,14 +281,15 @@ impl Runtime {
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
         let mut outputs: Vec<wgpu::Texture> = Vec::with_capacity(plan.kernels.len());
-        let mut new_cache: HashMap<u64, wgpu::Texture> = HashMap::with_capacity(plan.kernels.len());
+        self.tick += 1;
+        let tick = self.tick;
         let mut binds = Vec::with_capacity(plan.kernels.len());
 
         for (ki, kernel) in plan.kernels.iter().enumerate() {
-            if let Some(tex) = new_cache.get(&kernel.hash).cloned().or_else(|| self.cache.remove(&kernel.hash)) {
+            if let Some(e) = self.cache.get_mut(&kernel.hash) {
                 self.stats.cached += 1;
-                new_cache.insert(kernel.hash, tex.clone());
-                outputs.push(tex);
+                e.last_used = tick;
+                outputs.push(e.tex.clone());
                 continue;
             }
             self.stats.dispatched += 1;
@@ -326,7 +344,8 @@ impl Runtime {
                 entries: &entries,
             });
             binds.push((kernel.shader_key, bind));
-            new_cache.insert(kernel.hash, out.clone());
+            self.cache_bytes += tex_bytes(w, h);
+            self.cache.insert(kernel.hash, CacheEntry { tex: out.clone(), last_used: tick });
             outputs.push(out);
         }
 
@@ -340,11 +359,30 @@ impl Runtime {
             }
         }
 
-        // 上一輪留下、這輪沒用到的輸出回收到 pool。
-        for (_, t) in std::mem::replace(&mut self.cache, new_cache) {
-            self.pool.release(t);
-        }
+        self.evict(tick);
         (encoder, outputs.pop().expect("plan has an output kernel"))
+    }
+
+    /// 超過上限時淘汰最久未用、且本輪沒用到的輸出。
+    fn evict(&mut self, tick: u64) {
+        if self.cache_bytes <= self.cache_budget {
+            return;
+        }
+        let mut old: Vec<(u64, u64)> =
+            self.cache.iter().filter(|(_, e)| e.last_used < tick).map(|(k, e)| (e.last_used, *k)).collect();
+        old.sort_unstable();
+        for (_, k) in old {
+            if self.cache_bytes <= self.cache_budget {
+                break;
+            }
+            let e = self.cache.remove(&k).unwrap();
+            self.cache_bytes -= tex_bytes(e.tex.width(), e.tex.height());
+            self.pool.release(e.tex);
+        }
+    }
+
+    pub fn cache_bytes(&self) -> u64 {
+        self.cache_bytes
     }
 
     fn read_back(&mut self, mut encoder: wgpu::CommandEncoder, out: &wgpu::Texture) -> Image {
@@ -415,7 +453,7 @@ mod tests {
     use pixelnode_graph::{Graph, Link, Node, NodeId, Value};
 
     fn n(id: u64, kind: &str) -> Node {
-        Node { id: NodeId(id), kind: kind.into(), params: Default::default(), pos: [0.0; 2] }
+        Node { id: NodeId(id), kind: kind.into(), params: Default::default(), pos: [0.0; 2], anim: Default::default() }
     }
     fn link(a: u64, b: u64, port: usize) -> Link {
         Link { from_node: NodeId(a), from_port: 0, to_node: NodeId(b), to_port: port }
@@ -475,7 +513,7 @@ mod tests {
         let Ok(mut rt) = Runtime::new() else { return };
         let g = mixed();
         let fused = compile(&g).unwrap();
-        let unfused = compile_with(&g, CompileOptions { fuse: false }).unwrap();
+        let unfused = compile_with(&g, CompileOptions { fuse: false, ..Default::default() }).unwrap();
         assert!(fused.kernels.len() < unfused.kernels.len());
         let a = rt.execute(&fused, 0);
         rt.clear_cache();
@@ -483,6 +521,26 @@ mod tests {
         // 融合後中間值不經 RGBA8 量化，允許 ±2 的誤差。
         let max_diff = a.rgba.iter().zip(&b.rgba).map(|(x, y)| x.abs_diff(*y)).max().unwrap();
         assert!(max_diff <= 2, "max diff {max_diff}");
+    }
+
+    #[test]
+    fn lru_keeps_frames_within_budget() {
+        let Ok(mut rt) = Runtime::new() else { return };
+        let mut g = red_to_green();
+        let one = tex_bytes(17, 9);
+        rt.cache_budget = one * 3;
+        for i in 0..6 {
+            g.nodes[1].params.insert("hue".into(), Value::Float(i as f32 * 0.1));
+            rt.execute(&compile(&g).unwrap(), 0);
+        }
+        assert!(rt.cache_bytes() <= one * 3);
+        // 最近一次仍在快取中
+        rt.execute(&compile(&g).unwrap(), 0);
+        assert_eq!(rt.stats.cached, 1);
+        // 最早的已被淘汰
+        g.nodes[1].params.insert("hue".into(), Value::Float(0.0));
+        rt.execute(&compile(&g).unwrap(), 0);
+        assert_eq!(rt.stats.dispatched, 1);
     }
 
     #[test]

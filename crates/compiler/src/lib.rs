@@ -43,11 +43,13 @@ impl std::error::Error for CompileError {}
 pub struct CompileOptions {
     /// false 時每個節點各自一個 kernel（用於 benchmark 對照與除錯）。
     pub fuse: bool,
+    /// 取樣 keyframe 軌道的影格。
+    pub frame: u32,
 }
 
 impl Default for CompileOptions {
     fn default() -> Self {
-        Self { fuse: true }
+        Self { fuse: true, frame: 0 }
     }
 }
 
@@ -229,7 +231,7 @@ pub fn compile_with(graph: &Graph, opts: CompileOptions) -> Result<Plan, Compile
     }
 
     let out_id = graph.nodes.iter().find(|n| n.kind == "output").map(|n| n.id).ok_or(CompileError::NoOutput)?;
-    let steps = schedule(graph, &defs, out_id)?;
+    let steps = schedule(graph, &defs, out_id, opts.frame)?;
     let kernels = fuse(&steps, opts);
     Ok(Plan { canvas: graph.canvas, steps, kernels })
 }
@@ -239,6 +241,7 @@ fn schedule(
     graph: &Graph,
     defs: &HashMap<&'static str, &'static NodeDef>,
     out_id: NodeId,
+    frame: u32,
 ) -> Result<Vec<Step>, CompileError> {
     #[derive(Clone, Copy)]
     enum Mark {
@@ -255,6 +258,7 @@ fn schedule(
         &'a HashMap<(NodeId, usize), NodeId>,
         &'a HashMap<&'static str, &'static NodeDef>,
         [u32; 2],
+        u32,
     );
 
     fn visit(
@@ -269,7 +273,7 @@ fn schedule(
             None => {}
         }
         marks.insert(id, Mark::Visiting);
-        let (nodes, sources, defs, canvas) = cx;
+        let (nodes, sources, defs, canvas, frame) = cx;
         let node = nodes.get(&id).ok_or(CompileError::NoOutput)?;
         let def = *defs.get(node.kind.as_str()).ok_or_else(|| CompileError::UnknownKind(node.kind.clone()))?;
 
@@ -282,12 +286,16 @@ fn schedule(
 
         let mut params = [[0.0f32; 4]; MAX_PARAMS];
         for (slot, p) in params.iter_mut().zip(&def.params) {
-            *slot = node.params.get(p.name).unwrap_or(&p.default).to_vec4();
+            *slot = node.param_at(p.name, *frame).unwrap_or_else(|| p.default.clone()).to_vec4();
         }
 
         let mut h = std::collections::hash_map::DefaultHasher::new();
         def.kind.hash(&mut h);
         canvas.hash(&mut h);
+        // 與時間無關的節點不把影格納入 hash：參數值相同就跨影格共用快取。
+        if !def.time_invariant {
+            frame.hash(&mut h);
+        }
         for v in params.iter().flatten() {
             v.to_bits().hash(&mut h);
         }
@@ -303,7 +311,7 @@ fn schedule(
 
     let mut marks = HashMap::new();
     let mut steps = Vec::new();
-    visit(out_id, &(&nodes, &sources, defs, graph.canvas), &mut marks, &mut steps)?;
+    visit(out_id, &(&nodes, &sources, defs, graph.canvas, frame), &mut marks, &mut steps)?;
     Ok(steps)
 }
 
@@ -400,7 +408,7 @@ mod tests {
     use pixelnode_graph::{Link, Node, Value};
 
     fn node(id: u64, kind: &str) -> Node {
-        Node { id: NodeId(id), kind: kind.into(), params: Default::default(), pos: [0.0; 2] }
+        Node { id: NodeId(id), kind: kind.into(), params: Default::default(), pos: [0.0; 2], anim: Default::default() }
     }
     fn link(a: u64, b: u64, port: usize) -> Link {
         Link { from_node: NodeId(a), from_port: 0, to_node: NodeId(b), to_port: port }
@@ -450,7 +458,7 @@ mod tests {
         let plan = compile(&chain()).unwrap();
         assert_eq!(plan.kernels.len(), 1);
         assert_eq!(plan.kernels[0].members.len(), 3);
-        let unfused = compile_with(&chain(), CompileOptions { fuse: false }).unwrap();
+        let unfused = compile_with(&chain(), CompileOptions { fuse: false, ..Default::default() }).unwrap();
         assert_eq!(unfused.kernels.len(), 3);
     }
 
@@ -480,6 +488,27 @@ mod tests {
     }
 
     #[test]
+    fn static_graph_hash_is_frame_independent() {
+        let g = chain();
+        let at = |f| compile_with(&g, CompileOptions { frame: f, ..Default::default() }).unwrap().output_kernel().hash;
+        assert_eq!(at(0), at(7));
+    }
+
+    #[test]
+    fn keyframes_change_params_per_frame() {
+        let mut g = chain();
+        let mut t = pixelnode_graph::Track::default();
+        t.set_key(0, Value::Float(0.0));
+        t.set_key(10, Value::Float(1.0));
+        g.nodes[0].anim.insert("phase".into(), t);
+        let plan = |f| compile_with(&g, CompileOptions { frame: f, ..Default::default() }).unwrap();
+        let (a, b) = (plan(0), plan(5));
+        assert_ne!(a.output_kernel().hash, b.output_kernel().hash);
+        assert_eq!(a.output_kernel().shader_key, b.output_kernel().shader_key);
+        assert_eq!(b.kernels[0].params[7], [0.5, 0.0, 0.0, 0.0]); // noise 第 8 個參數 = phase
+    }
+
+    #[test]
     fn duplicate_kinds_get_unique_names() {
         let g = Graph {
             nodes: vec![node(1, "noise"), node(2, "noise"), node(3, "blend"), node(4, "output")],
@@ -490,6 +519,6 @@ mod tests {
         assert_eq!(plan.kernels.len(), 1);
         let src = plan.kernel_wgsl(0);
         assert!(src.contains("fn m0_noise_perlin") && src.contains("fn m1_noise_perlin"));
-        assert!(src.contains("PB.p[5u + 1]"), "第二個 noise 的參數從 5 開始");
+        assert!(src.contains("PB.p[8u + 1]"), "第二個 noise 的參數從 8 開始");
     }
 }
