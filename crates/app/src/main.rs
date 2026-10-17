@@ -486,7 +486,7 @@ impl App {
         let files = ctx.input(|i| i.raw.dropped_files.clone());
         let def = pixelnode_nodes::find("image").expect("image node exists");
         for (k, f) in files.iter().enumerate() {
-            let Some(path) = &f.path else { continue };
+            let path = f.path();
             if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("png")) {
                 self.status = format!("只支援 PNG：{}", path.display());
                 continue;
