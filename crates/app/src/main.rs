@@ -8,7 +8,7 @@ use egui_snarl::{InPin, InPinId, NodeId, OutPin, OutPinId, Snarl};
 use history::{Command, History};
 use pixelnode_graph::{Graph, Link, Node, Value};
 use pixelnode_nodes::{NodeDef, ParamKind};
-use pixelnode_runtime::worker::{EvalResult, Evaluator};
+use pixelnode_runtime::worker::{EvalResult, Evaluator, Preview};
 use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -244,6 +244,22 @@ fn default_snarl() -> Snarl<NodeData> {
     s
 }
 
+enum PreviewTex {
+    /// 與求值共用 device：直接顯示 GPU texture。
+    Native { id: egui::TextureId, size: egui::Vec2 },
+    /// 退路：CPU 讀回後上傳。
+    Managed(egui::TextureHandle),
+}
+
+impl PreviewTex {
+    fn id_size(&self) -> (egui::TextureId, egui::Vec2) {
+        match self {
+            PreviewTex::Native { id, size } => (*id, *size),
+            PreviewTex::Managed(t) => (t.id(), t.size_vec2()),
+        }
+    }
+}
+
 struct App {
     snarl: Snarl<NodeData>,
     style: SnarlStyle,
@@ -254,7 +270,8 @@ struct App {
     /// 上次送出的求值 snapshot（不含節點位置），用於避免重複送出。
     submitted: Option<Graph>,
     last: Option<EvalResult>,
-    preview: Option<egui::TextureHandle>,
+    preview: Option<PreviewTex>,
+    render_state: Option<eframe::egui_wgpu::RenderState>,
     path: String,
     status: String,
 }
@@ -263,13 +280,18 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_cjk_font(&cc.egui_ctx);
         let ctx = cc.egui_ctx.clone();
+        let render_state = cc.wgpu_render_state.clone();
+        let shared = render_state
+            .as_ref()
+            .map(|rs| (rs.device.clone(), rs.queue.clone(), rs.adapter.get_info().name));
         Self {
             snarl: default_snarl(),
             style: SnarlStyle { collapsible: Some(true), ..SnarlStyle::new() },
             defs: pixelnode_nodes::registry().iter().map(|d| (d.kind.to_string(), d.clone())).collect(),
             history: History::default(),
             canvas: [128, 128],
-            evaluator: Evaluator::spawn(move || ctx.request_repaint()),
+            evaluator: Evaluator::spawn(shared, move || ctx.request_repaint()),
+            render_state,
             submitted: None,
             last: None,
             preview: None,
@@ -338,13 +360,41 @@ impl App {
     }
 
     fn receive(&mut self, ctx: &egui::Context) {
-        if let Some(res) = self.evaluator.poll() {
-            if let Ok(img) = &res.image {
-                let color = egui::ColorImage::from_rgba_unmultiplied([img.width as usize, img.height as usize], &img.rgba);
-                match &mut self.preview {
-                    Some(t) => t.set(color, egui::TextureOptions::NEAREST),
-                    None => self.preview = Some(ctx.load_texture("preview", color, egui::TextureOptions::NEAREST)),
+        for res in self.evaluator.poll() {
+            match &res.preview {
+                Ok(Preview::Gpu { texture, fresh }) => {
+                    let size = egui::vec2(texture.width() as f32, texture.height() as f32);
+                    let rs = self.render_state.as_ref().expect("GPU preview requires wgpu render state");
+                    let mut renderer = rs.renderer.write();
+                    if let Some(PreviewTex::Native { id, size: s }) = &mut self.preview {
+                        *s = size;
+                        if *fresh {
+                            let view = texture.create_view(&Default::default());
+                            renderer.update_egui_texture_from_wgpu_texture(
+                                &rs.device,
+                                &view,
+                                eframe::wgpu::FilterMode::Nearest,
+                                *id,
+                            );
+                        }
+                    } else {
+                        let view = texture.create_view(&Default::default());
+                        let id = renderer.register_native_texture(&rs.device, &view, eframe::wgpu::FilterMode::Nearest);
+                        self.preview = Some(PreviewTex::Native { id, size });
+                    }
                 }
+                Ok(Preview::Cpu(img)) => {
+                    let color =
+                        egui::ColorImage::from_rgba_unmultiplied([img.width as usize, img.height as usize], &img.rgba);
+                    match &mut self.preview {
+                        Some(PreviewTex::Managed(t)) => t.set(color, egui::TextureOptions::NEAREST),
+                        _ => {
+                            self.preview =
+                                Some(PreviewTex::Managed(ctx.load_texture("preview", color, egui::TextureOptions::NEAREST)))
+                        }
+                    }
+                }
+                Err(_) => {}
             }
             self.last = Some(res);
         }
@@ -359,7 +409,7 @@ impl App {
             }
         });
         if let Some(res) = &self.last {
-            match &res.image {
+            match &res.preview {
                 Ok(_) => ui.label(format!(
                     "{:.2} ms · {} kernels（執行 {} / 快取 {}）",
                     res.elapsed.as_secs_f64() * 1000.0,
@@ -373,10 +423,10 @@ impl App {
         ui.separator();
         if let Some(tex) = &self.preview {
             // 整數縮放，point filtering。
-            let size = tex.size_vec2();
+            let (id, size) = tex.id_size();
             let avail = ui.available_size();
             let scale = (avail.x / size.x).min(avail.y / size.y).floor().max(1.0);
-            ui.image((tex.id(), size * scale));
+            ui.image((id, size * scale));
         }
     }
 }

@@ -77,6 +77,8 @@ pub struct Runtime {
     cache: HashMap<u64, wgpu::Texture>,
     pub stats: Stats,
     pub adapter_name: String,
+    /// 預覽用 texture：只由 copy 寫入，不進 pool，UI 可安全持有。
+    display: Option<wgpu::Texture>,
 }
 
 impl Runtime {
@@ -96,6 +98,11 @@ impl Runtime {
             ..Default::default()
         }))
         .map_err(|e| format!("建立 GPU device 失敗：{e}"))?;
+        Ok(Self::with_device(device, queue, adapter.get_info().name))
+    }
+
+    /// 使用既有 device（例如與 eframe 共用，預覽不必讀回 CPU）。
+    pub fn with_device(device: wgpu::Device, queue: wgpu::Queue, adapter_name: String) -> Self {
 
         let mut entries = vec![
             wgpu::BindGroupLayoutEntry {
@@ -161,8 +168,8 @@ impl Runtime {
         let param_align = device.limits().min_storage_buffer_offset_alignment as u64;
         let params = create_param_buffer(&device, 64 << 10);
 
-        Ok(Self {
-            adapter_name: adapter.get_info().name,
+        Self {
+            adapter_name,
             device,
             queue,
             layout,
@@ -176,7 +183,8 @@ impl Runtime {
             pool: TexturePool::default(),
             cache: HashMap::new(),
             stats: Stats::default(),
-        })
+            display: None,
+        }
     }
 
     /// 清空輸出快取（benchmark 冷啟動用；pipeline 快取保留）。
@@ -190,6 +198,35 @@ impl Runtime {
     pub fn execute(&mut self, plan: &Plan, frame: u32) -> Image {
         let (encoder, out) = self.encode(plan, frame);
         self.read_back(encoder, &out)
+    }
+
+    /// 執行並把 Output 複製到預覽 texture（GPU 內複製）。
+    /// 回傳的 bool 表示 texture 是新建的（尺寸改變），UI 需重新註冊。
+    pub fn execute_to_display(&mut self, plan: &Plan, frame: u32) -> (wgpu::Texture, bool) {
+        let (mut encoder, out) = self.encode(plan, frame);
+        let (w, h) = (out.width(), out.height());
+        let fresh = self.display.as_ref().is_none_or(|d| d.width() != w || d.height() != h);
+        if fresh {
+            self.display = Some(self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("display"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            }));
+        }
+        let display = self.display.clone().unwrap();
+        encoder.copy_texture_to_texture(
+            out.as_image_copy(),
+            display.as_image_copy(),
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.queue.submit([encoder.finish()]);
+        self.device.poll(wgpu::PollType::wait_indefinitely()).expect("GPU poll failed");
+        (display, fresh)
     }
 
     /// 執行並等待 GPU 完成，不讀回（benchmark 用）。
