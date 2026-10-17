@@ -179,7 +179,7 @@ impl App {
         let sel: HashSet<NodeId> =
             get_selected_nodes(graph_id(), ctx).into_iter().filter(|id| self.snarl.get_node(*id).is_some()).collect();
         if sel.is_empty() {
-            return Err("請先選取節點（Shift/Ctrl 點選或框選）".into());
+            return Err("請先選取節點（Shift+點選，或 Shift+拖曳框選）".into());
         }
         if sel.iter().any(|id| matches!(self.snarl[*id].kind.as_str(), "output" | "group_in" | "group_out")) {
             return Err("Output / Group In / Group Out 不能收進子圖".into());

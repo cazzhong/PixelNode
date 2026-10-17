@@ -699,7 +699,7 @@ impl eframe::App for App {
                     self.history.redo(&mut self.snarl);
                 }
                 ui.separator();
-                ui.weak("右鍵新增節點 · Del 刪除 · Ctrl+Z/Y · 空白鍵播放 · ←→ 逐格");
+                ui.weak("右鍵新增節點 · Shift+點選選取 · Del 刪除 · Ctrl+Z/Y · 空白鍵播放 · ←→ 逐格");
                 ui.label(&self.status);
             });
         });
