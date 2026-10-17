@@ -36,7 +36,7 @@ fn def(
     per_pixel: bool,
     wgsl: &'static str,
 ) -> NodeDef {
-    NodeDef { kind, title, category, inputs, outputs: SURF_OUT, params, per_pixel, time_invariant: true, wgsl }
+    NodeDef { kind, title, category, inputs, outputs: SURF_OUT, params, per_pixel, time_invariant: true, cost: 0, wgsl }
 }
 
 // ---------------------------------------------------------------- 生成

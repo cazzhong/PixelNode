@@ -1,8 +1,9 @@
 //! 圖編譯：型別檢查 → pull-based 拓撲排序（含循環偵測）→ 節點融合 → WGSL 生成。
 //!
 //! 融合規則：一個逐像素節點若只有唯一一個消費者、且消費者也是逐像素節點，
-//! 就併入消費者的 kernel（不落地成 texture）。其餘節點（Output、多消費者、
-//! 非逐像素）是融合邊界，各自是一個 kernel 的 root。
+//! 就併入消費者的 kernel（不落地成 texture）。被多個節點共用、但子樹夠便宜的
+//! 節點，會複製進每個消費者重算（[`INLINE_COST_BUDGET`]）。其餘節點（Output、
+//! 昂貴的共用節點、非逐像素）是融合邊界，各自是一個 kernel 的 root。
 //!
 //! 參數一律走 storage buffer，WGSL 只依「子圖結構」生成，[`Kernel::shader_key`]
 //! 相同就共用已編譯的 pipeline，改參數不重編。
@@ -15,6 +16,11 @@ use std::hash::{Hash, Hasher};
 
 /// 單一 kernel 最多可讀取的輸入 texture 數。
 pub const MAX_KERNEL_TEXTURES: usize = 8;
+/// 被多個節點共用的子樹，若成本不超過此值就在每個消費者內重算，
+/// 省下一次 texture 落地與 dispatch。
+pub const INLINE_COST_BUDGET: u32 = 12;
+/// 重算最多複製到幾個消費者。
+pub const INLINE_MAX_USES: usize = 4;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompileError {
@@ -62,6 +68,8 @@ pub struct Step {
     pub params: [[f32; 4]; MAX_PARAMS],
     /// hash(種類 + 參數 + 輸入 hash + 尺寸)，作為輸出快取 key。
     pub hash: u64,
+    /// 自身或上游有 keyframe / 與時間相關 → 輸出會隨影格變化。
+    pub animated: bool,
 }
 
 /// kernel 內某成員的某個輸入從哪裡來。
@@ -283,6 +291,9 @@ fn schedule(
                 *slot = Some(visit(src, cx, marks, steps)?);
             }
         }
+        let animated = !def.time_invariant
+            || node.anim.values().any(|t| t.keys.len() > 1)
+            || inputs.iter().flatten().any(|&i| steps[i].animated);
 
         let mut params = [[0.0f32; 4]; MAX_PARAMS];
         for (slot, p) in params.iter_mut().zip(&def.params) {
@@ -303,7 +314,7 @@ fn schedule(
             i.map(|i| steps[i].hash).hash(&mut h);
         }
 
-        steps.push(Step { node: id, def, inputs, params, hash: h.finish() });
+        steps.push(Step { node: id, def, inputs, params, hash: h.finish(), animated });
         let idx = steps.len() - 1;
         marks.insert(id, Mark::Done(idx));
         Ok(idx)
@@ -317,42 +328,52 @@ fn schedule(
 
 fn fuse(steps: &[Step], opts: CompileOptions) -> Vec<Kernel> {
     let n = steps.len();
-    let mut uses = vec![0usize; n];
-    let mut consumer = vec![usize::MAX; n];
+    let mut consumers: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (i, s) in steps.iter().enumerate() {
         for src in s.inputs.iter().flatten() {
-            uses[*src] += 1;
-            consumer[*src] = i;
+            consumers[*src].push(i);
         }
     }
-    let mut root: Vec<bool> = (0..n)
-        .map(|i| {
-            !opts.fuse
-                || i == n - 1
-                || uses[i] != 1
-                || !steps[i].def.per_pixel
-                || !steps[consumer[i]].def.per_pixel
-        })
-        .collect();
+    // 拓撲順序：輸入一定在前，所以計算 i 時其上游的 root / 成本都已確定。
+    let mut root = vec![true; n];
+    let mut subtree_cost = vec![0u32; n];
+    for i in 0..n {
+        let own: u32 = steps[i].def.cost
+            + steps[i].inputs.iter().flatten().map(|&s| if root[s] { 1 } else { subtree_cost[s] }).sum::<u32>();
+        subtree_cost[i] = own;
+        let uses = consumers[i].len();
+        let fusable = opts.fuse
+            && i != n - 1
+            && steps[i].def.per_pixel
+            && consumers[i].iter().all(|&c| steps[c].def.per_pixel);
+        // 靜態子樹餵給會動的節點：若不便宜就落地，讓它跨影格留在快取裡。
+        let cache_boundary =
+            !steps[i].animated && own > INLINE_COST_BUDGET && consumers[i].iter().any(|&c| steps[c].animated);
+        root[i] = cache_boundary
+            || !(fusable && (uses == 1 || (uses <= INLINE_MAX_USES && own <= INLINE_COST_BUDGET)));
+    }
 
     loop {
         match build_kernels(steps, &root) {
             Ok(k) => return k,
-            // texture 槽位不夠：把該 kernel 內所有非 root 成員升為 root 後重試。
-            Err(members) => members.into_iter().for_each(|m| root[m] = true),
+            // texture 槽位不夠：把該 kernel 最大的一個融合分支升為 root 後重試。
+            Err(split) => root[split] = true,
         }
     }
 }
 
-fn build_kernels(steps: &[Step], root: &[bool]) -> Result<Vec<Kernel>, Vec<usize>> {
+/// 失敗時回傳要拆開的成員（root 的直接融合輸入中，子樹最大的那個）。
+fn build_kernels(steps: &[Step], root: &[bool]) -> Result<Vec<Kernel>, usize> {
     let mut kernel_of = vec![usize::MAX; steps.len()];
     let mut kernels = Vec::new();
 
     for r in (0..steps.len()).filter(|&i| root[i]) {
         // 收集 r 的融合子樹（後序 = 拓撲順序）。
+        // 重算的共用節點在同一 kernel 內可能經由兩條路徑到達，只收一次。
         fn collect(i: usize, steps: &[Step], root: &[bool], top: usize, out: &mut Vec<usize>) {
             for src in steps[i].inputs.iter().flatten() {
-                if !root[*src] && *src != top {
+                // 子樹很小（通常 < 20），線性查找比雜湊快。
+                if !root[*src] && *src != top && !out.contains(src) {
                     collect(*src, steps, root, top, out);
                 }
             }
@@ -392,7 +413,20 @@ fn build_kernels(steps: &[Step], root: &[bool]) -> Result<Vec<Kernel>, Vec<usize
         }
 
         if textures.len() > MAX_KERNEL_TEXTURES {
-            return Err(order[..order.len() - 1].to_vec());
+            let subtree = |s: usize| {
+                let mut v = Vec::new();
+                collect(s, steps, root, r, &mut v);
+                v.len()
+            };
+            let split = steps[r]
+                .inputs
+                .iter()
+                .flatten()
+                .copied()
+                .filter(|&s| !root[s])
+                .max_by_key(|&s| subtree(s))
+                .expect("over-limit kernel must have a fused input");
+            return Err(split);
         }
         textures.len().hash(&mut key);
 
@@ -463,8 +497,32 @@ mod tests {
     }
 
     #[test]
+    fn static_expensive_branch_is_cached_before_animated_node() {
+        let mut g = chain();
+        let mut t = pixelnode_graph::Track::default();
+        t.set_key(0, Value::Float(0.0));
+        t.set_key(10, Value::Float(0.5));
+        g.nodes[1].anim.insert("hue".into(), t); // color_adjust 會動，noise 靜態
+        let plan = compile(&g).unwrap();
+        assert_eq!(plan.kernels.len(), 2, "noise 應在動態節點前落地");
+    }
+
+    #[test]
+    fn cheap_shared_node_is_recomputed() {
+        // solid 同時餵給 color_adjust 與 blend：便宜，直接在一個 kernel 內共用。
+        let g = Graph {
+            nodes: vec![node(1, "solid"), node(2, "color_adjust"), node(3, "blend"), node(4, "output")],
+            links: vec![link(1, 2, 0), link(1, 3, 0), link(2, 3, 1), link(3, 4, 0)],
+            ..Default::default()
+        };
+        let plan = compile(&g).unwrap();
+        assert_eq!(plan.kernels.len(), 1);
+        assert_eq!(plan.kernels[0].members.len(), 4); // solid 只出現一次
+    }
+
+    #[test]
     fn shared_node_is_fusion_boundary() {
-        // noise 同時餵給 blend 的兩個輸入 → 必須落地成 texture。
+        // 昂貴的 noise 同時餵給 blend 的兩個輸入 → 必須落地成 texture。
         let g = Graph {
             nodes: vec![node(1, "noise"), node(2, "color_adjust"), node(3, "blend"), node(4, "output")],
             links: vec![link(1, 2, 0), link(1, 3, 0), link(2, 3, 1), link(3, 4, 0)],

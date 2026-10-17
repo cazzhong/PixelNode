@@ -78,6 +78,8 @@ fn main() {
     // 第一輪後每格只重算受影響的 kernel；第二輪整段命中影格快取。
     let mut g = graph.clone();
     animate_one(&mut g, FRAMES);
+    // 暖機：動畫圖的 kernel 結構不同，先編好 pipeline。
+    rt.run(&compile_with(&g, CompileOptions { frame: 0, ..fused_opts }).unwrap(), 0);
     rt.clear_cache();
     for name in ["animated 1 track, 1st loop ×60", "animated 1 track, 2nd loop ×60"] {
         let t = Instant::now();

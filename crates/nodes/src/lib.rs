@@ -72,6 +72,8 @@ pub struct NodeDef {
     pub per_pixel: bool,
     /// 與時間無關（動畫中只需算一次）。
     pub time_invariant: bool,
+    /// 每像素相對成本估計（約略 ALU 量），融合器用來決定共用節點要不要重算。
+    pub cost: u32,
     pub wgsl: &'static str,
 }
 
@@ -126,6 +128,15 @@ pub fn registry() -> &'static [NodeDef] {
     REG.get_or_init(|| {
         let mut v = vec![solid(), noise(), color_adjust(), blend(), output()];
         v.extend(library::all());
+        for d in &mut v {
+            d.cost = match d.kind {
+                "solid" | "output" | "checker" | "mirror" | "posterize" => 1,
+                "noise" => 40,
+                "blur" | "outline" => 25,
+                "color_adjust" | "dither" | "palette_map" => 4,
+                _ => 3,
+            };
+        }
         v
     })
 }
@@ -167,6 +178,7 @@ fn solid() -> NodeDef {
         }],
         per_pixel: true,
         time_invariant: true,
+        cost: 0,
         wgsl: "fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> { return P[0]; }",
     }
 }
@@ -196,6 +208,7 @@ fn noise() -> NodeDef {
         ],
         per_pixel: true,
         time_invariant: true,
+        cost: 0,
         wgsl: r#"
 fn noise_lattice(i: vec2<f32>, s: f32, ph: f32) -> f32 {
     return 0.5 + 0.5 * sin(6.2831853 * (pn_hash2(i, s) + ph));
@@ -270,6 +283,7 @@ fn color_adjust() -> NodeDef {
         ],
         per_pixel: true,
         time_invariant: true,
+        cost: 0,
         wgsl: r#"
 fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> {
     let src = in_at(0u, px);
@@ -302,6 +316,7 @@ fn blend() -> NodeDef {
         ],
         per_pixel: true,
         time_invariant: true,
+        cost: 0,
         wgsl: r#"
 fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> {
     let a = in_at(0u, px);
@@ -331,6 +346,7 @@ fn output() -> NodeDef {
         params: vec![],
         per_pixel: true,
         time_invariant: true,
+        cost: 0,
         wgsl: "fn node_fn(px: vec2<u32>, uv: vec2<f32>) -> vec4<f32> { return in_at(0u, px); }",
     }
 }
