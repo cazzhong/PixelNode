@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = ["crates/graph", "crates/compiler", "crates/runtime", "crates/nodes", "crates/app", "benches"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+pixelnode-graph = { path = "crates/graph" }
+pixelnode-nodes = { path = "crates/nodes" }
+pixelnode-compiler = { path = "crates/compiler" }
+pixelnode-runtime = { path = "crates/runtime" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wgpu = "30"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "accesskit"] }
+egui-snarl = "0.12"
+
+[profile.dev.package."*"]
+opt-level = 2

@@ -1,0 +1,12 @@
+[package]
+name = "pixelnode-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pixelnode-graph.workspace = true
+pixelnode-nodes.workspace = true
+pixelnode-compiler.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true

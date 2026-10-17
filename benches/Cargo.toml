@@ -1,0 +1,14 @@
+[package]
+name = "pixelnode-bench"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+pixelnode-graph.workspace = true
+pixelnode-compiler.workspace = true
+pixelnode-runtime.workspace = true
+
+[[bench]]
+name = "pipeline"
+harness = false

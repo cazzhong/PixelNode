@@ -1,0 +1,13 @@
+[package]
+name = "pixelnode"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pixelnode-graph.workspace = true
+pixelnode-nodes.workspace = true
+pixelnode-compiler.workspace = true
+pixelnode-runtime.workspace = true
+serde_json.workspace = true
+eframe.workspace = true
+egui-snarl.workspace = true

@@ -1,0 +1,7 @@
+[package]
+name = "pixelnode-nodes"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pixelnode-graph.workspace = true
