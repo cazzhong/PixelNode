@@ -37,13 +37,15 @@ pub fn decode_png(path: &Path) -> Result<Image, String> {
     let src = &buf[..info.buffer_size()];
     let rgba: Vec<u8> = match info.color_type {
         png::ColorType::Rgba => src.to_vec(),
-        png::ColorType::Rgb => src.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
-        png::ColorType::GrayscaleAlpha => src.chunks_exact(2).flat_map(|p| [p[0], p[0], p[0], p[1]]).collect(),
+        png::ColorType::Rgb => src.as_chunks::<3>().0.iter().flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
+        png::ColorType::GrayscaleAlpha => src.as_chunks::<2>().0.iter().flat_map(|p| [p[0], p[0], p[0], p[1]]).collect(),
         png::ColorType::Grayscale => src.iter().flat_map(|&g| [g, g, g, 255]).collect(),
         png::ColorType::Indexed => return Err("未展開的調色盤 PNG".into()),
     };
     Ok(Image { width: w, height: h, rgba })
 }
+
+type PixelMap = Box<dyn Fn(i64, i64) -> Option<(i64, i64)>>;
 
 /// 貼合模式：0 原尺寸置中、1 整數縮放置中、2 拉伸、3 左上原尺寸。
 pub fn fit(img: &Image, w: u32, h: u32, mode: u32) -> Image {
@@ -51,7 +53,7 @@ pub fn fit(img: &Image, w: u32, h: u32, mode: u32) -> Image {
     let (iw, ih) = (img.width as i64, img.height as i64);
     let (cw, ch) = (w as i64, h as i64);
     // 目標像素 → 來源像素（以整數運算，保證最近鄰、不模糊）。
-    let map: Box<dyn Fn(i64, i64) -> Option<(i64, i64)>> = match mode {
+    let map: PixelMap = match mode {
         2 => Box::new(move |x, y| Some((x * iw / cw, y * ih / ch))),
         1 => {
             let s = (cw / iw).min(ch / ih).max(1);
